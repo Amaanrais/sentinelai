@@ -16,3 +16,8 @@ accelerate>=0.30
 
 # Optional: for nicer notebook conversion
 jupytext>=1.16
+
+# Web serving
+fastapi>=0.111
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9

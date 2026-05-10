@@ -1,0 +1,9 @@
+{
+  "model": "distilbert-base-uncased",
+  "run_name": "distilbert_v1",
+  "epochs": 4,
+  "batch_size": 16,
+  "learning_rate": 2e-05,
+  "max_length": 256,
+  "seed": 42
+}

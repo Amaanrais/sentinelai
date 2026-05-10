@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data (large, reproducible via build_dataset_v1.py)
+data/
+
+# Model weights (large binary files — track with Git LFS or exclude entirely)
+models/distilbert_v1/model.safetensors
+models/roberta_v1/model.safetensors
+models/distilbert_v1/training_args.bin
+models/roberta_v1/training_args.bin
+models/baseline_tfidf_lr.joblib
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
