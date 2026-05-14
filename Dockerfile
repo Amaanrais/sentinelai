@@ -8,6 +8,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY scripts/ ./scripts/
 COPY app/ ./app/
 COPY models/distilbert_v1/ ./models/distilbert_v1/
+COPY models/roberta_v1/ ./models/roberta_v1/
+COPY models/baseline_tfidf_lr.joblib ./models/baseline_tfidf_lr.joblib
 
 EXPOSE 7860
 
