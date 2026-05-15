@@ -1,11 +1,18 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>SentinelAI — Prompt Intent Classifier</title>
   <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
 
     body {
       background: #0f0f1a;
@@ -30,7 +37,9 @@
       color: #ffffff;
     }
 
-    header h1 span { color: #7c6aff; }
+    header h1 span {
+      color: #7c6aff;
+    }
 
     header p {
       margin-top: 8px;
@@ -104,16 +113,16 @@
       line-height: 1.4;
     }
 
-    .model-option input[type="radio"]:checked + label {
+    .model-option input[type="radio"]:checked+label {
       border-color: #7c6aff;
       background: #1f1b3a;
     }
 
-    .model-option input[type="radio"]:checked + label .model-name {
+    .model-option input[type="radio"]:checked+label .model-name {
       color: #a898ff;
     }
 
-    .model-option input[type="radio"]:checked + label .model-meta {
+    .model-option input[type="radio"]:checked+label .model-meta {
       color: #7a6ab8;
     }
 
@@ -147,8 +156,13 @@
       transition: border-color 0.2s;
     }
 
-    textarea::placeholder { color: #4a4a6a; }
-    textarea:focus { border-color: #7c6aff; }
+    textarea::placeholder {
+      color: #4a4a6a;
+    }
+
+    textarea:focus {
+      border-color: #7c6aff;
+    }
 
     button#analyze-btn {
       margin-top: 16px;
@@ -168,20 +182,30 @@
       gap: 10px;
     }
 
-    button#analyze-btn:hover:not(:disabled) { background: #6a58e8; }
-    button#analyze-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+    button#analyze-btn:hover:not(:disabled) {
+      background: #6a58e8;
+    }
+
+    button#analyze-btn:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
 
     .spinner {
       display: none;
       width: 18px;
       height: 18px;
-      border: 2px solid rgba(255,255,255,0.3);
+      border: 2px solid rgba(255, 255, 255, 0.3);
       border-top-color: #fff;
       border-radius: 50%;
       animation: spin 0.7s linear infinite;
     }
 
-    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes spin {
+      to {
+        transform: rotate(360deg);
+      }
+    }
 
     /* ── Result card ── */
     #result-card {
@@ -207,10 +231,17 @@
       padding: 10px 0 18px;
     }
 
-    .verdict.benign    { color: #00b894; }
-    .verdict.malicious { color: #d63031; }
+    .verdict.benign {
+      color: #00b894;
+    }
 
-    .bar-row { margin-bottom: 12px; }
+    .verdict.malicious {
+      color: #d63031;
+    }
+
+    .bar-row {
+      margin-bottom: 12px;
+    }
 
     .bar-label {
       display: flex;
@@ -237,8 +268,13 @@
       transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
     }
 
-    .bar-fill.benign    { background: #00b894; }
-    .bar-fill.malicious { background: #d63031; }
+    .bar-fill.benign {
+      background: #00b894;
+    }
+
+    .bar-fill.malicious {
+      background: #d63031;
+    }
 
     /* ── Error banner ── */
     #error-banner {
@@ -260,6 +296,7 @@
     }
   </style>
 </head>
+
 <body>
 
   <header>
@@ -301,11 +338,8 @@
 
     <!-- Prompt input -->
     <label class="prompt-label" for="prompt-input">Prompt</label>
-    <textarea
-      id="prompt-input"
-      placeholder="Type or paste a prompt to analyze — e.g. &quot;How do I pick a lock?&quot;"
-      maxlength="2000"
-    ></textarea>
+    <textarea id="prompt-input" placeholder="Type or paste a prompt to analyze — e.g. &quot;How do I pick a lock?&quot;"
+      maxlength="2000"></textarea>
 
     <button id="analyze-btn" type="button">
       <span class="spinner" id="spinner"></span>
@@ -340,26 +374,25 @@
     </div>
   </div>
 
-  <footer>SentinelAI &mdash; GRC Final Project</footer>
 
   <script>
-    const btn         = document.getElementById("analyze-btn");
-    const spinner     = document.getElementById("spinner");
-    const btnLabel    = document.getElementById("btn-label");
-    const input       = document.getElementById("prompt-input");
-    const errBanner   = document.getElementById("error-banner");
-    const resultCard  = document.getElementById("result-card");
-    const verdictEl   = document.getElementById("verdict-text");
-    const resultTag   = document.getElementById("result-model-tag");
-    const barBenign   = document.getElementById("bar-benign");
-    const barMalic    = document.getElementById("bar-malicious");
-    const pctBenign   = document.getElementById("pct-benign");
-    const pctMalic    = document.getElementById("pct-malicious");
+    const btn = document.getElementById("analyze-btn");
+    const spinner = document.getElementById("spinner");
+    const btnLabel = document.getElementById("btn-label");
+    const input = document.getElementById("prompt-input");
+    const errBanner = document.getElementById("error-banner");
+    const resultCard = document.getElementById("result-card");
+    const verdictEl = document.getElementById("verdict-text");
+    const resultTag = document.getElementById("result-model-tag");
+    const barBenign = document.getElementById("bar-benign");
+    const barMalic = document.getElementById("bar-malicious");
+    const pctBenign = document.getElementById("pct-benign");
+    const pctMalic = document.getElementById("pct-malicious");
 
     const MODEL_LABELS = {
       distilbert_v1: "DistilBERT v1",
-      roberta_v1:    "RoBERTa v1",
-      baseline:      "TF-IDF + LR (Baseline)",
+      roberta_v1: "RoBERTa v1",
+      baseline: "TF-IDF + LR (Baseline)",
     };
 
     function selectedModel() {
@@ -390,19 +423,19 @@
       const m = Math.round(data.prob_malicious * 100);
 
       barBenign.style.width = "0%";
-      barMalic.style.width  = "0%";
+      barMalic.style.width = "0%";
       void barBenign.offsetWidth; // force reflow for CSS transition
 
       requestAnimationFrame(() => {
         barBenign.style.width = b + "%";
-        barMalic.style.width  = m + "%";
+        barMalic.style.width = m + "%";
         pctBenign.textContent = b + "%";
-        pctMalic.textContent  = m + "%";
+        pctMalic.textContent = m + "%";
       });
     }
 
     btn.addEventListener("click", async () => {
-      const text  = input.value.trim();
+      const text = input.value.trim();
       const model = selectedModel();
       if (!text) { showError("Please enter a prompt before analyzing."); return; }
 
@@ -433,4 +466,5 @@
     });
   </script>
 </body>
+
 </html>
