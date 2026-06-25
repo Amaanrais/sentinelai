@@ -202,16 +202,17 @@ sentinelai/
 | Source | Role | Size | Licence |
 |---|---|---|---|
 | jackhhao/jailbreak-classification | Both | ~1,400 prompts | CC-BY |
-| Harelix/Prompt-Injection-Mixed-Techniques-2024 | Both | variable | Apache 2.0 |
-| allenai/wildjailbreak (adversarial subset) | Malicious | up to 1,000 | Apache 2.0 |
-| rubend18/ChatGPT-Jailbreak-Prompts | Malicious | variable | See upstream |
-| fka/awesome-chatgpt-prompts | Benign | ~170 prompts | CC0 |
-| Curated handcrafted seeds | Both | ~120 prompts | Author-original |
-| Synthetic template augmentation | Malicious | ~90 prompts | Author-original |
+| rubend18/ChatGPT-Jailbreak-Prompts | Malicious | variable | Open |
+| allenai/wildjailbreak | Malicious | up to 1,000 | Apache 2.0 |
+| deepset/prompt-injections | Both | variable | Apache 2.0 |
+| xTRam1/safe-guard-prompt-injection | Both | variable | MIT |
+| Anthropic/hh-rlhf (helpful split) | Benign | up to 2,000 | MIT |
+| Curated handcrafted seeds | Both | ~130 prompts | Author-original |
+| Synthetic template augmentation | Malicious | ~120 prompts | Author-original |
 
-Attack categories covered: `direct_harmful_request`, `fictional_framing`, `persona_jailbreak`, `indirect_rag_injection`, `authority_claim`, `obfuscated_payload`, `payload_splitting`, `goal_hijacking`, `adversarial_jailbreak`.
+Attack categories covered: `direct_harmful_request`, `fictional_framing`, `persona_jailbreak`, `indirect_rag_injection`, `authority_claim`, `obfuscated_payload`, `goal_hijacking`, `adversarial_jailbreak`, `prompt_injection`.
 
-Final corpus: ~3,000 prompts at a 50/50 benign-to-malicious ratio, stratified 70/15/15 train/val/test split.
+Final corpus: ~3,000 prompts at a strict 50/50 benign-to-malicious ratio (oversamples minority class if needed), stratified 70/15/15 train/val/test split.
 
 ---
 
