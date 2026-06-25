@@ -172,7 +172,7 @@ def main(args):
         per_device_eval_batch_size=args.batch_size * 2,
         learning_rate=args.learning_rate,
         weight_decay=0.01,
-        warmup_ratio=0.1,
+        warmup_steps=int(0.1 * args.epochs * (len(train_df) // args.batch_size)),
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
@@ -191,7 +191,7 @@ def main(args):
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
     )
