@@ -2,7 +2,7 @@
 
 SentinelAI is a machine learning system that detects malicious intent in natural language prompts before they reach a downstream AI model. It targets a specific class of attack where harmful requests are embedded inside socially or professionally plausible framing — role-play scenarios, educational justifications, hypothetical contexts — that bypass surface-level keyword filters entirely.
 
-The system classifies prompts semantically rather than lexically, using fine-tuned transformer models trained on a curated dataset of ~2,500 prompts covering six jailbreak attack categories. It was developed as a practical implementation of the **Prompt Injection Testing AI-ASCT** from the CAIMOM-Aligned Catalogue, positioned as a pre-inference gate that intercepts and classifies prompts before a downstream LLM processes them.
+The system classifies prompts semantically rather than lexically, using fine-tuned transformer models trained on a curated dataset of ~3,000 prompts covering nine jailbreak attack categories. It was developed as a practical implementation of the **Prompt Injection Testing AI-ASCT** from the CAIMOM-Aligned Catalogue, positioned as a pre-inference gate that intercepts and classifies prompts before a downstream LLM processes them.
 
 ---
 
@@ -142,26 +142,26 @@ Open [http://localhost:7860](http://localhost:7860).
 The full data and training pipeline is scripted and reproducible. Run stages in order:
 
 ```bash
-# Stage A — Build handcrafted seed dataset
-python scripts/build_seed_dataset.py
+# Stage A — Build dataset (fetches HuggingFace sources + curated seeds + synthetic augmentation)
+# Requires internet. Outputs data/dataset_v1*.csv and data/dataset_v1_summary.json
+python scripts/build_dataset.py
 
-# Stage B — Fetch public benchmark datasets (requires internet)
-python scripts/fetch_public_sources.py
-
-# Stage C — Merge, clean, deduplicate, and split
-python scripts/build_dataset_v1.py
-
-# Stage D — Train baseline (CPU, ~30 seconds)
+# Stage B — Train baseline (CPU, ~30 seconds)
 python scripts/train_baseline.py
 
-# Stage D — Fine-tune transformers (GPU recommended, ~10 min each)
+# Stage B — Fine-tune transformers (GPU recommended, ~10 min on Colab T4)
 python scripts/train_distilbert.py
 
-# Stage E — Evaluate all models
+# Stage B — Fine-tune RoBERTa (stronger, ~10 min on Colab T4)
+python scripts/train_distilbert.py --model roberta-base --run-name roberta_v1
+
+# Stage C — Evaluate all models (integrated into training scripts, or run standalone)
 python scripts/evaluation.py
 ```
 
 All randomness is fixed at `RANDOM_SEED=42`. Re-running the pipeline on the same source data produces identical results.
+
+> **Offline fallback**: if HuggingFace is unavailable, `build_dataset.py` skips those sources and builds from the curated seeds and synthetic templates only (~300 rows). Training will still work but metrics will be lower. Run with internet access for the full ~3,000-row corpus.
 
 ---
 
@@ -174,13 +174,18 @@ sentinelai/
 │   └── static/
 │       └── index.html             # Single-page web UI
 ├── scripts/
-│   ├── build_seed_dataset.py      # Stage A: handcrafted seed prompts
-│   ├── fetch_public_sources.py    # Stage B: public benchmark acquisition
-│   ├── build_dataset_v1.py        # Stage C: merge, clean, balance, split
-│   ├── train_baseline.py          # Stage D: TF-IDF + Logistic Regression
-│   ├── train_distilbert.py        # Stage D: DistilBERT / RoBERTa fine-tuning
+│   ├── build_dataset.py           # Stage A: unified dataset builder (HF + curated + synthetic)
+│   ├── train_baseline.py          # Stage B: TF-IDF + Logistic Regression
+│   ├── train_distilbert.py        # Stage B: DistilBERT / RoBERTa fine-tuning
 │   ├── classifier.py              # Inference wrapper (IntentClassifier)
 │   └── evaluation.py              # Model-agnostic evaluation harness
+├── data/                          # Generated at runtime by build_dataset.py
+│   ├── dataset_v1.csv             # Full balanced dataset (~3,000 rows)
+│   ├── dataset_v1_train.csv       # 70% stratified split
+│   ├── dataset_v1_val.csv         # 15% stratified split
+│   ├── dataset_v1_test.csv        # 15% stratified split
+│   ├── dataset_v1_summary.json    # Structured statistics
+│   └── dataset_stats.txt          # Human-readable report
 ├── models/
 │   ├── distilbert_v1/             # Fine-tuned DistilBERT (config + tokenizer)
 │   ├── roberta_v1/                # Fine-tuned RoBERTa (config + tokenizer)
@@ -196,13 +201,17 @@ sentinelai/
 
 | Source | Role | Size | Licence |
 |---|---|---|---|
-| Handcrafted seed | Both | ~100 prompts | Author-original |
-| JailbreakBench / JBB-Behaviors | Malicious | ~100 prompts | MIT |
-| AdvBench (Zou et al., 2023) | Malicious | ~520 prompts | MIT |
-| Anthropic HH-RLHF Helpful-Base | Benign | ~3,000 (capped) | MIT |
-| Verazuo Forbidden Questions | Malicious | ~390 prompts | See upstream |
+| jackhhao/jailbreak-classification | Both | ~1,400 prompts | CC-BY |
+| Harelix/Prompt-Injection-Mixed-Techniques-2024 | Both | variable | Apache 2.0 |
+| allenai/wildjailbreak (adversarial subset) | Malicious | up to 1,000 | Apache 2.0 |
+| rubend18/ChatGPT-Jailbreak-Prompts | Malicious | variable | See upstream |
+| fka/awesome-chatgpt-prompts | Benign | ~170 prompts | CC0 |
+| Curated handcrafted seeds | Both | ~120 prompts | Author-original |
+| Synthetic template augmentation | Malicious | ~90 prompts | Author-original |
 
-Final corpus: ~2,000–2,500 prompts at a ~1.2:1 benign-to-malicious ratio.
+Attack categories covered: `direct_harmful_request`, `fictional_framing`, `persona_jailbreak`, `indirect_rag_injection`, `authority_claim`, `obfuscated_payload`, `payload_splitting`, `goal_hijacking`, `adversarial_jailbreak`.
+
+Final corpus: ~3,000 prompts at a 50/50 benign-to-malicious ratio, stratified 70/15/15 train/val/test split.
 
 ---
 
