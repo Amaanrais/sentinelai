@@ -88,8 +88,7 @@ def main(args: argparse.Namespace) -> int:
 
     print(f"train={len(train_df):,}  val={len(val_df):,}  test={len(test_df):,}")
     if len(train_df) < 30:
-        print("WARNING: very small dataset. Run scripts/fetch_public_sources.py "
-              "to pull JailbreakBench/AdvBench/HH-RLHF first.")
+        print("WARNING: very small dataset. Run scripts/build_dataset.py first.")
 
     print("\nFitting pipeline ...")
     t0 = time.time()
