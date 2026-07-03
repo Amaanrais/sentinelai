@@ -1,3 +1,12 @@
+---
+title: SentinelAI
+emoji: 🛡️
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
+
 # SentinelAI — Prompt Injection Detection
 
 SentinelAI is a machine learning system that detects malicious intent in natural language prompts before they reach a downstream AI model. It targets a specific class of attack where harmful requests are embedded inside socially or professionally plausible framing — role-play scenarios, educational justifications, hypothetical contexts — that bypass surface-level keyword filters entirely.

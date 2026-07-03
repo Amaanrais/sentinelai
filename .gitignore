@@ -45,5 +45,8 @@ Thumbs.db
 # Secrets
 .env
 
+# HF upload script — contains runtime token prompt, never commit
+push_to_hf.py
+
 # Probe results (large, reproducible)
 results/
