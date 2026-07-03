@@ -22,7 +22,6 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from datasets import load_dataset
 from dotenv import load_dotenv
 from tqdm import tqdm
 
@@ -32,7 +31,8 @@ from tqdm import tqdm
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
-RESULTS_DIR = REPO_ROOT / "results"
+RESULTS_DIR  = REPO_ROOT / "results"
+PROBE_DATA   = REPO_ROOT / "probe_data" / "probe_data.csv"
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 # ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ ALL_MODELS: list[dict] = [
     {
         "label":    "gemini",
         "provider": "google",
-        "model_id": "gemini-1.5-pro",
+        "model_id": "gemini-2.5-flash",
         "env_key":  "GOOGLE_API_KEY",
     },
     {
@@ -77,16 +77,17 @@ ALL_MODELS: list[dict] = [
         "base_url": "https://openrouter.ai/api/v1",
     },
     {
-        "label":    "gemma-3",
+        "label":    "gemma-4",
         "provider": "google",
-        "model_id": "gemma-3-27b-it",
+        "model_id": "gemma-4-31b-it",
         "env_key":  "GOOGLE_API_KEY",
     },
 ]
 
 CSV_FIELDS = [
-    "prompt_id", "behavior", "category", "source",
-    "goal", "model", "model_id", "response", "latency_s", "error", "timestamp",
+    "prompt_id", "prompt", "label", "attack_type", "injection_vector",
+    "surface_benignity", "obfuscation_method", "tier", "multi_turn_group",
+    "model", "model_id", "response", "latency_s", "error", "timestamp",
 ]
 
 
@@ -133,15 +134,18 @@ def _call_anthropic(model_id: str, prompt: str, api_key: str, max_tokens: int) -
 
 
 def _call_google(model_id: str, prompt: str, api_key: str, max_tokens: int) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(
-        model_id,
-        system_instruction=SYSTEM_PROMPT,
-        generation_config=genai.types.GenerationConfig(max_output_tokens=max_tokens),
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model_id,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=max_tokens,
+        ),
     )
-    resp = model.generate_content(prompt)
-    return resp.text
+    return resp.text or ""
 
 
 def _dispatch(cfg: dict, prompt: str, max_tokens: int) -> str:
@@ -207,6 +211,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Seconds to wait between calls to the same model.")
     p.add_argument("--output", type=str, default=None,
                    help="Output CSV path. Defaults to results/probe_results_<timestamp>.csv.")
+    p.add_argument("--append", action="store_true",
+                   help="Append rows to an existing CSV instead of creating a new file.")
     p.add_argument("--dry-run", action="store_true",
                    help="Print first prompt per model without calling any API.")
     return p.parse_args()
@@ -220,9 +226,10 @@ def main() -> None:
     args = _parse_args()
 
     # --- Load dataset ---
-    print("Loading JailbreakBench/JBB-Behaviors (harmful split)…")
-    ds = load_dataset("JailbreakBench/JBB-Behaviors", "behaviors", split="harmful")
-    prompts: list[dict] = list(ds)
+    import csv as _csv
+    print(f"Loading {PROBE_DATA}…")
+    with open(PROBE_DATA, newline="", encoding="utf-8") as _fh:
+        prompts: list[dict] = list(_csv.DictReader(_fh))
     print(f"  {len(prompts)} prompts loaded.\n")
 
     # --- Select and validate models ---
@@ -259,13 +266,15 @@ def main() -> None:
 
     if args.dry_run:
         for m in active:
-            print(f"[DRY RUN] {m['label']:12s} | {prompts[0]['Goal'][:100]}…")
+            print(f"[DRY RUN] {m['label']:12s} | {prompts[0]['prompt'][:100]}…")
         return
 
     # --- Run probes ---
-    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+    file_mode = "a" if args.append else "w"
+    with open(out_path, file_mode, newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
-        writer.writeheader()
+        if not args.append:
+            writer.writeheader()
         fh.flush()
 
         for model_cfg in active:
@@ -273,21 +282,25 @@ def main() -> None:
                 tqdm(prompts, desc=f"{model_cfg['label']:12s}", unit="prompt", leave=True)
             ):
                 t0 = time.perf_counter()
-                response, error = _call_with_retry(model_cfg, row["Goal"], args.max_tokens)
+                response, error = _call_with_retry(model_cfg, row["prompt"], args.max_tokens)
                 latency = round(time.perf_counter() - t0, 3)
 
                 writer.writerow({
-                    "prompt_id": row["Index"],
-                    "behavior":  row["Behavior"],
-                    "category":  row["Category"],
-                    "source":    row["Source"],
-                    "goal":      row["Goal"],
-                    "model":     model_cfg["label"],
-                    "model_id":  model_cfg["model_id"],
-                    "response":  response,
-                    "latency_s": latency,
-                    "error":     error,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "prompt_id":        row["id"],
+                    "prompt":           row["prompt"],
+                    "label":            row["label"],
+                    "attack_type":      row["attack_type"],
+                    "injection_vector": row["injection_vector"],
+                    "surface_benignity":row["surface_benignity"],
+                    "obfuscation_method":row["obfuscation_method"],
+                    "tier":             row["tier"],
+                    "multi_turn_group": row["multi_turn_group"],
+                    "model":            model_cfg["label"],
+                    "model_id":         model_cfg["model_id"],
+                    "response":         response,
+                    "latency_s":        latency,
+                    "error":            error,
+                    "timestamp":        datetime.now(timezone.utc).isoformat(),
                 })
                 fh.flush()
 
