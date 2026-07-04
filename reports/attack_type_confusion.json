@@ -1,0 +1,354 @@
+{
+  "table_a_in_distribution": {
+    "source": "dataset_v1_test.csv",
+    "n": 450,
+    "results": {
+      "injection": {
+        "DistilBERT": {
+          "detected": 147,
+          "total": 147,
+          "recall": 1.0
+        },
+        "RoBERTa": {
+          "detected": 147,
+          "total": 147,
+          "recall": 1.0
+        },
+        "TF-IDF+LR": {
+          "detected": 147,
+          "total": 147,
+          "recall": 1.0
+        }
+      },
+      "jailbreak_explicit": {
+        "DistilBERT": {
+          "detected": 46,
+          "total": 47,
+          "recall": 0.9787234042553191
+        },
+        "RoBERTa": {
+          "detected": 46,
+          "total": 47,
+          "recall": 0.9787234042553191
+        },
+        "TF-IDF+LR": {
+          "detected": 43,
+          "total": 47,
+          "recall": 0.9148936170212766
+        }
+      },
+      "prompt_injection": {
+        "DistilBERT": {
+          "detected": 12,
+          "total": 14,
+          "recall": 0.8571428571428571
+        },
+        "RoBERTa": {
+          "detected": 12,
+          "total": 14,
+          "recall": 0.8571428571428571
+        },
+        "TF-IDF+LR": {
+          "detected": 11,
+          "total": 14,
+          "recall": 0.7857142857142857
+        }
+      },
+      "indirect_rag_injection": {
+        "DistilBERT": {
+          "detected": 6,
+          "total": 6,
+          "recall": 1.0
+        },
+        "RoBERTa": {
+          "detected": 6,
+          "total": 6,
+          "recall": 1.0
+        },
+        "TF-IDF+LR": {
+          "detected": 6,
+          "total": 6,
+          "recall": 1.0
+        }
+      },
+      "fictional_framing": {
+        "DistilBERT": {
+          "detected": 5,
+          "total": 5,
+          "recall": 1.0
+        },
+        "RoBERTa": {
+          "detected": 4,
+          "total": 5,
+          "recall": 0.8
+        },
+        "TF-IDF+LR": {
+          "detected": 5,
+          "total": 5,
+          "recall": 1.0
+        }
+      },
+      "authority_claim": {
+        "DistilBERT": {
+          "detected": 3,
+          "total": 3,
+          "recall": 1.0
+        },
+        "RoBERTa": {
+          "detected": 3,
+          "total": 3,
+          "recall": 1.0
+        },
+        "TF-IDF+LR": {
+          "detected": 2,
+          "total": 3,
+          "recall": 0.6666666666666666
+        }
+      },
+      "persona_jailbreak": {
+        "DistilBERT": {
+          "detected": 2,
+          "total": 2,
+          "recall": 1.0
+        },
+        "RoBERTa": {
+          "detected": 2,
+          "total": 2,
+          "recall": 1.0
+        },
+        "TF-IDF+LR": {
+          "detected": 2,
+          "total": 2,
+          "recall": 1.0
+        }
+      },
+      "direct_harmful_request": {
+        "DistilBERT": {
+          "detected": 0,
+          "total": 1,
+          "recall": 0.0
+        },
+        "RoBERTa": {
+          "detected": 0,
+          "total": 1,
+          "recall": 0.0
+        },
+        "TF-IDF+LR": {
+          "detected": 0,
+          "total": 1,
+          "recall": 0.0
+        }
+      },
+      "none_benign": {
+        "DistilBERT": {
+          "false_positives": 4,
+          "total_benign": 225,
+          "specificity": 0.9822222222222222
+        },
+        "RoBERTa": {
+          "false_positives": 4,
+          "total_benign": 225,
+          "specificity": 0.9822222222222222
+        },
+        "TF-IDF+LR": {
+          "false_positives": 4,
+          "total_benign": 225,
+          "specificity": 0.9822222222222222
+        }
+      }
+    }
+  },
+  "table_b_out_of_distribution": {
+    "source": "probe_data_v2.csv",
+    "n": 440,
+    "results": {
+      "persona_jailbreak": {
+        "DistilBERT": {
+          "detected": 40,
+          "total": 40,
+          "recall": 1.0
+        },
+        "RoBERTa": {
+          "detected": 31,
+          "total": 40,
+          "recall": 0.775
+        },
+        "TF-IDF+LR": {
+          "detected": 35,
+          "total": 40,
+          "recall": 0.875
+        }
+      },
+      "indirect_rag_injection": {
+        "DistilBERT": {
+          "detected": 37,
+          "total": 40,
+          "recall": 0.925
+        },
+        "RoBERTa": {
+          "detected": 35,
+          "total": 40,
+          "recall": 0.875
+        },
+        "TF-IDF+LR": {
+          "detected": 30,
+          "total": 40,
+          "recall": 0.75
+        }
+      },
+      "goal_hijacking": {
+        "DistilBERT": {
+          "detected": 38,
+          "total": 40,
+          "recall": 0.95
+        },
+        "RoBERTa": {
+          "detected": 25,
+          "total": 40,
+          "recall": 0.625
+        },
+        "TF-IDF+LR": {
+          "detected": 26,
+          "total": 40,
+          "recall": 0.65
+        }
+      },
+      "authority_claim": {
+        "DistilBERT": {
+          "detected": 34,
+          "total": 40,
+          "recall": 0.85
+        },
+        "RoBERTa": {
+          "detected": 17,
+          "total": 40,
+          "recall": 0.425
+        },
+        "TF-IDF+LR": {
+          "detected": 29,
+          "total": 40,
+          "recall": 0.725
+        }
+      },
+      "direct_harmful_request": {
+        "DistilBERT": {
+          "detected": 28,
+          "total": 40,
+          "recall": 0.7
+        },
+        "RoBERTa": {
+          "detected": 15,
+          "total": 40,
+          "recall": 0.375
+        },
+        "TF-IDF+LR": {
+          "detected": 15,
+          "total": 40,
+          "recall": 0.375
+        }
+      },
+      "obfuscated_payload": {
+        "DistilBERT": {
+          "detected": 27,
+          "total": 40,
+          "recall": 0.675
+        },
+        "RoBERTa": {
+          "detected": 19,
+          "total": 40,
+          "recall": 0.475
+        },
+        "TF-IDF+LR": {
+          "detected": 7,
+          "total": 40,
+          "recall": 0.175
+        }
+      },
+      "completion_hijack": {
+        "DistilBERT": {
+          "detected": 30,
+          "total": 40,
+          "recall": 0.75
+        },
+        "RoBERTa": {
+          "detected": 7,
+          "total": 40,
+          "recall": 0.175
+        },
+        "TF-IDF+LR": {
+          "detected": 10,
+          "total": 40,
+          "recall": 0.25
+        }
+      },
+      "fictional_framing": {
+        "DistilBERT": {
+          "detected": 20,
+          "total": 40,
+          "recall": 0.5
+        },
+        "RoBERTa": {
+          "detected": 10,
+          "total": 40,
+          "recall": 0.25
+        },
+        "TF-IDF+LR": {
+          "detected": 12,
+          "total": 40,
+          "recall": 0.3
+        }
+      },
+      "payload_splitting": {
+        "DistilBERT": {
+          "detected": 19,
+          "total": 40,
+          "recall": 0.475
+        },
+        "RoBERTa": {
+          "detected": 7,
+          "total": 40,
+          "recall": 0.175
+        },
+        "TF-IDF+LR": {
+          "detected": 7,
+          "total": 40,
+          "recall": 0.175
+        }
+      },
+      "hypothetical_framing": {
+        "DistilBERT": {
+          "detected": 5,
+          "total": 40,
+          "recall": 0.125
+        },
+        "RoBERTa": {
+          "detected": 1,
+          "total": 40,
+          "recall": 0.025
+        },
+        "TF-IDF+LR": {
+          "detected": 2,
+          "total": 40,
+          "recall": 0.05
+        }
+      },
+      "camouflaged_harmful": {
+        "DistilBERT": {
+          "detected": 4,
+          "total": 40,
+          "recall": 0.1
+        },
+        "RoBERTa": {
+          "detected": 1,
+          "total": 40,
+          "recall": 0.025
+        },
+        "TF-IDF+LR": {
+          "detected": 1,
+          "total": 40,
+          "recall": 0.025
+        }
+      }
+    }
+  }
+}
