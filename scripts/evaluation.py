@@ -73,6 +73,7 @@ class EvaluationReport:
     per_topic_top10: GroupedRecall
     calibration: dict[str, float]
     top_misclassified: list[dict]
+    per_benignity_tier: GroupedRecall | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -167,6 +168,7 @@ def _top_misclassified(df: pd.DataFrame, k: int = 20) -> list[dict]:
             "y_pred": int(row["y_pred"]),
             "y_prob": (float(row["y_prob"]) if "y_prob" in row else None),
             "attack_type": row.get("attack_type", "?"),
+            "surface_benignity": row.get("surface_benignity"),
             "source": row.get("source", "?"),
             "topic": row.get("topic", "?"),
         })
@@ -178,7 +180,8 @@ def evaluate(model_name: str,
              classify_fn: ClassifyFn,
              batch_size: int = 64) -> EvaluationReport:
     """Run a full evaluation. test_df must have columns:
-       prompt, label, attack_type, source, topic"""
+       prompt, label, attack_type
+       Optional: source, topic, surface_benignity"""
 
     prompts = test_df["prompt"].tolist()
     y_true = test_df["label"].to_numpy()
@@ -201,15 +204,29 @@ def evaluate(model_name: str,
     df["y_pred"] = y_pred
     df["y_prob"] = y_prob
 
+    per_source = (
+        _grouped_recall(df, "source")
+        if "source" in df.columns else GroupedRecall()
+    )
+    per_topic = (
+        _grouped_recall(df, "topic", top_n=10)
+        if "topic" in df.columns else GroupedRecall()
+    )
+    per_benignity = (
+        _grouped_recall(df, "surface_benignity")
+        if "surface_benignity" in df.columns else None
+    )
+
     return EvaluationReport(
         model_name=model_name,
         headline=headline(y_true, y_pred, y_prob),
         confusion_matrix=cm,
         per_attack_type=_grouped_recall(df, "attack_type"),
-        per_source=_grouped_recall(df, "source"),
-        per_topic_top10=_grouped_recall(df, "topic", top_n=10),
+        per_source=per_source,
+        per_topic_top10=per_topic,
         calibration=_calibration(y_true, y_prob),
         top_misclassified=_top_misclassified(df, k=20),
+        per_benignity_tier=per_benignity,
     )
 
 
@@ -257,19 +274,34 @@ def render_markdown(report: EvaluationReport) -> str:
     _grouped_table("Per source", report.per_source)
     _grouped_table("Per topic (top 10)", report.per_topic_top10)
 
+    if report.per_benignity_tier is not None:
+        _tier_labels = {0: "Obvious", 1: "Mild", 2: "Moderate", 3: "High"}
+        lines.append("\n## Per surface_benignity tier\n")
+        lines.append("| tier | disguise level | support | pos | neg | detection rate | specificity |")
+        lines.append("|---|---|---:|---:|---:|---:|---:|")
+        for grp, m in sorted(report.per_benignity_tier.by_group.items(),
+                              key=lambda kv: int(kv[0])):
+            label = _tier_labels.get(int(grp), "?")
+            lines.append(
+                f"| {grp} | {label} | {m['support']} | {m['positives']} | "
+                f"{m['negatives']} | {_fmt(m['recall_on_positives'])} | "
+                f"{_fmt(m['specificity_on_negatives'])} |"
+            )
+
     if report.calibration:
         lines.append("\n## Calibration\n")
         for k, v in report.calibration.items():
             lines.append(f"- **{k}**: {_fmt(v)}")
 
     lines.append("\n## Top 20 misclassifications (highest-confidence wrongs)\n")
-    lines.append("| true | pred | prob | attack_type | source | prompt |")
-    lines.append("|---|---|---:|---|---|---|")
+    lines.append("| true | pred | prob | attack_type | tier | source | prompt |")
+    lines.append("|---|---|---:|---|---|---|---|")
     for m in report.top_misclassified:
         lines.append(
             f"| {m['y_true']} | {m['y_pred']} | "
             f"{_fmt(m['y_prob'])} | {m['attack_type']} | "
-            f"{m['source']} | {m['prompt'].replace('|', '/')} |"
+            f"{_fmt(m.get('surface_benignity'))} | {m.get('source', '?')} | "
+            f"{m['prompt'].replace('|', '/')} |"
         )
 
     return "\n".join(lines)
@@ -288,6 +320,10 @@ def save_report(report: EvaluationReport, out_dir: Path) -> dict[str, Path]:
         "per_attack_type": report.per_attack_type.by_group,
         "per_source": report.per_source.by_group,
         "per_topic_top10": report.per_topic_top10.by_group,
+        "per_benignity_tier": (
+            report.per_benignity_tier.by_group
+            if report.per_benignity_tier is not None else None
+        ),
         "calibration": report.calibration,
         "top_misclassified": report.top_misclassified,
     }
