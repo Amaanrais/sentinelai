@@ -3,16 +3,28 @@ build_dataset.py
 ================
 Unified dataset builder for SentinelAI prompt injection detection.
 
-Changes from v1:
-  - Removed fka/awesome-chatgpt-prompts (system prompts, wrong data type)
-  - Fixed rubend18 column mapping (field is 'text', all rows are malicious)
-  - Fixed wildjailbreak: use split='train', filter by 'data_type' column
-  - Added deepset/prompt-injections (purpose-built injection dataset)
-  - Added xTRam1/safe-guard-prompt-injection
-  - Added Anthropic/hh-rlhf helpful split (proper benign queries)
-  - jackhhao now pulls both train + test splits
-  - enforce_balance() with oversampling replaces simple sample()
-  - sklearn stratified split replaces manual bucket approach
+Changes from v1 (original, confounded dataset):
+  - attack_type used to map 1:1 onto surface_benignity (every row from a given
+    HF source/category sat at exactly one tier), which meant "disguise level"
+    and "attack strategy / data source" were perfectly collinear and could not
+    be studied as independent variables.
+  - Fix: generate a dedicated attack_type x surface_benignity grid (11 attack
+    types x 4 tiers, each cell generated independently by an LLM, mirroring
+    the approach already used for probe_data_v2 -- see attack_taxonomy.py and
+    build_probe_data_v2.py) so tier varies *within* each attack_type.
+  - Cap each scraped HF source's row contribution so no single source (e.g.
+    xTRam1/safe-guard-prompt-injection, previously 1973/3000 = 66% of the
+    whole dataset) dominates a class.
+  - Add a small LLM-generated benign grid across varied topics so growing the
+    malicious side doesn't force enforce_balance() to oversample-with-
+    replacement (duplicate rows) to hit the benign target.
+  - Deduplicate against probe_data/probe_data_v2.csv so the held-out OOD probe
+    set has zero literal overlap with training data.
+  - Stratified split now stratifies on (label, attack_type) instead of just
+    label, so every split preserves the attack_type x tier grid proportionally.
+  - Stats report now includes an explicit attack_type x surface_benignity
+    crosstab -- the evidence that the confound is fixed (should be a full
+    matrix, not a diagonal).
 
 Binary labels:
     1 = malicious (prompt injection, jailbreak, or disguised harmful request)
@@ -37,6 +49,7 @@ Sources:
     [5] xTRam1/safe-guard-prompt-injection         MIT
     [6] Anthropic/hh-rlhf (helpful split)          MIT
     [7] curated_seed + synthetic (this script)     original
+    [8] llm_generated_grid (this script)           original -- decoupled attack_type x tier
 
 Outputs (all written to data/):
     dataset_v1.csv              full merged, balanced dataset
@@ -47,13 +60,20 @@ Outputs (all written to data/):
     dataset_stats.txt           human-readable report
 
 Run:
-    pip install datasets pandas huggingface_hub scikit-learn
+    pip install datasets pandas huggingface_hub scikit-learn openai python-dotenv
     python scripts/build_dataset.py
+    python scripts/build_dataset.py --skip-grid            # reuse existing grid checkpoint / skip LLM calls
+    python scripts/build_dataset.py --grid-n 20             # smaller/cheaper grid for a test run
+    python scripts/build_dataset.py --dry-run-grid          # print one generation prompt, no API calls
 """
 
+import argparse
 import hashlib
 import json
+import os
 import random
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -62,32 +82,50 @@ from sklearn.model_selection import train_test_split
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
+PROBE_DATA_V2 = ROOT / "probe_data" / "probe_data_v2.csv"
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from attack_taxonomy import ATTACK_TYPES, TIER_DEFINITIONS, TIERS  # noqa: E402
 
 RANDOM_SEED = 42
 random.seed(RANDOM_SEED)
 
-TARGET_PER_CLASS = 1500   # 1500 mal + 1500 benign = 3000 total
+TARGET_PER_CLASS = 2000   # 2000 mal + 2000 benign = 4000 total
+MAX_PER_HF_SOURCE = 300   # cap so no single scraped source dominates a class
 
 
 # ---------------------------------------------------------------------------
 # SECTION 1: HuggingFace source pulling
 # ---------------------------------------------------------------------------
 
+def _cap_source(rows: list[dict], cap: int, label: str) -> list[dict]:
+    """Downsample a single source's rows to `cap` if it exceeds it."""
+    if len(rows) <= cap:
+        return rows
+    print(f"    [cap] {label}: {len(rows)} -> {cap} (source capped)")
+    return random.sample(rows, cap)
+
+
 def pull_hf() -> list[dict]:
-    """Pull from open HuggingFace datasets. Falls back gracefully per source."""
+    """Pull from open HuggingFace datasets. Falls back gracefully per source.
+
+    Each source's rows are capped at MAX_PER_HF_SOURCE before being folded
+    into the shared pool, so no single source can dominate a class the way
+    xTRam1/safe-guard-prompt-injection did in v1 (1973/3000 rows, 66%).
+    """
     rows = []
 
     try:
         from datasets import load_dataset
     except ImportError:
         print("[!] 'datasets' not installed. Run: pip install datasets huggingface_hub")
-        print("    Skipping HuggingFace sources -- using curated + synthetic only.\n")
+        print("    Skipping HuggingFace sources -- using curated + synthetic + grid only.\n")
         return rows
 
     # -- [1] jackhhao/jailbreak-classification: both splits, correct label field --
     try:
         print("[*] jackhhao/jailbreak-classification ...")
-        before = len(rows)
+        src_rows = []
         for split in ["train", "test"]:
             ds = load_dataset("jackhhao/jailbreak-classification", split=split)
             for item in ds:
@@ -95,7 +133,7 @@ def pull_hf() -> list[dict]:
                 lbl = 1 if str(item.get("type", "")).lower() == "jailbreak" else 0
                 if not text:
                     continue
-                rows.append({
+                src_rows.append({
                     "prompt": text, "label": lbl,
                     "attack_type": "jailbreak_explicit" if lbl else "none",
                     "injection_vector": "direct" if lbl else "none",
@@ -104,20 +142,22 @@ def pull_hf() -> list[dict]:
                     "topic": "jailbreak" if lbl else "benign_general",
                     "source": "jackhhao/jailbreak-classification [1]",
                 })
-        print(f"    -> {len(rows) - before} rows (both splits)")
+        src_rows = _cap_source(src_rows, MAX_PER_HF_SOURCE, "jackhhao")
+        print(f"    -> {len(src_rows)} rows (both splits, post-cap)")
+        rows.extend(src_rows)
     except Exception as e:
         print(f"    ! jackhhao failed: {e}")
 
     # -- [2] rubend18/ChatGPT-Jailbreak-Prompts: field is 'text', all rows malicious --
     try:
         print("[*] rubend18/ChatGPT-Jailbreak-Prompts ...")
-        before = len(rows)
+        src_rows = []
         ds = load_dataset("rubend18/ChatGPT-Jailbreak-Prompts", split="train")
         for item in ds:
             text = (item.get("text") or item.get("prompt") or item.get("Prompt") or "").strip()
             if not text:
                 continue
-            rows.append({
+            src_rows.append({
                 "prompt": text, "label": 1,
                 "attack_type": "persona_jailbreak",
                 "injection_vector": "direct",
@@ -126,14 +166,16 @@ def pull_hf() -> list[dict]:
                 "topic": "jailbreak_dan",
                 "source": "rubend18/ChatGPT-Jailbreak-Prompts [2]",
             })
-        print(f"    -> {len(rows) - before} rows")
+        src_rows = _cap_source(src_rows, MAX_PER_HF_SOURCE, "rubend18")
+        print(f"    -> {len(src_rows)} rows (post-cap)")
+        rows.extend(src_rows)
     except Exception as e:
         print(f"    ! rubend18 failed: {e}")
 
     # -- [3] allenai/wildjailbreak: use split='train', filter by data_type column --
     try:
         print("[*] allenai/wildjailbreak ...")
-        before = len(rows)
+        src_rows = []
         ds = load_dataset("allenai/wildjailbreak", "train", split="train")
         n = 0
         for item in ds:
@@ -141,7 +183,7 @@ def pull_hf() -> list[dict]:
             text = (item.get("adversarial") or item.get("prompt") or "").strip()
             if not text or dtype not in ("adversarial", "vanilla"):
                 continue
-            rows.append({
+            src_rows.append({
                 "prompt": text, "label": 1,
                 "attack_type": "adversarial_jailbreak" if dtype == "adversarial" else "direct_harmful_request",
                 "injection_vector": "direct",
@@ -153,21 +195,23 @@ def pull_hf() -> list[dict]:
             n += 1
             if n >= 1000:
                 break
-        print(f"    -> {len(rows) - before} rows")
+        src_rows = _cap_source(src_rows, MAX_PER_HF_SOURCE, "wildjailbreak")
+        print(f"    -> {len(src_rows)} rows (post-cap)")
+        rows.extend(src_rows)
     except Exception as e:
         print(f"    ! wildjailbreak failed: {e}")
 
     # -- [4] deepset/prompt-injections: purpose-built injection dataset --
     try:
         print("[*] deepset/prompt-injections ...")
-        before = len(rows)
+        src_rows = []
         ds = load_dataset("deepset/prompt-injections", split="train")
         for item in ds:
             text = (item.get("text") or item.get("prompt") or "").strip()
             lbl = int(item.get("label", 0))
             if not text:
                 continue
-            rows.append({
+            src_rows.append({
                 "prompt": text, "label": lbl,
                 "attack_type": "prompt_injection" if lbl else "none",
                 "injection_vector": "direct" if lbl else "none",
@@ -176,14 +220,16 @@ def pull_hf() -> list[dict]:
                 "topic": "prompt_injection" if lbl else "benign_general",
                 "source": "deepset/prompt-injections [4]",
             })
-        print(f"    -> {len(rows) - before} rows")
+        src_rows = _cap_source(src_rows, MAX_PER_HF_SOURCE, "deepset")
+        print(f"    -> {len(src_rows)} rows (post-cap)")
+        rows.extend(src_rows)
     except Exception as e:
         print(f"    ! deepset/prompt-injections failed: {e}")
 
     # -- [5] xTRam1/safe-guard-prompt-injection --
     try:
         print("[*] xTRam1/safe-guard-prompt-injection ...")
-        before = len(rows)
+        src_rows = []
         ds = load_dataset("xTRam1/safe-guard-prompt-injection", split="train")
         for item in ds:
             text = (item.get("prompt") or item.get("text") or "").strip()
@@ -191,7 +237,7 @@ def pull_hf() -> list[dict]:
             atype = str(item.get("attack_type") or item.get("type") or "injection").lower()
             if not text:
                 continue
-            rows.append({
+            src_rows.append({
                 "prompt": text, "label": lbl,
                 "attack_type": atype if lbl else "none",
                 "injection_vector": "direct" if lbl else "none",
@@ -200,14 +246,16 @@ def pull_hf() -> list[dict]:
                 "topic": "injection_categorical",
                 "source": "xTRam1/safe-guard-prompt-injection [5]",
             })
-        print(f"    -> {len(rows) - before} rows")
+        src_rows = _cap_source(src_rows, MAX_PER_HF_SOURCE, "xTRam1")
+        print(f"    -> {len(src_rows)} rows (post-cap)")
+        rows.extend(src_rows)
     except Exception as e:
         print(f"    ! xTRam1 failed: {e}")
 
     # -- [6] Anthropic/hh-rlhf helpful split: proper benign user queries --
     try:
         print("[*] Anthropic/hh-rlhf (helpful, benign only) ...")
-        before = len(rows)
+        src_rows = []
         ds = load_dataset("Anthropic/hh-rlhf", data_dir="helpful-base", split="train[:2000]")
         for item in ds:
             chosen = item.get("chosen", "")
@@ -217,7 +265,7 @@ def pull_hf() -> list[dict]:
                 human_part = chosen[:300].strip()
             if not human_part or len(human_part) < 10:
                 continue
-            rows.append({
+            src_rows.append({
                 "prompt": human_part, "label": 0,
                 "attack_type": "none",
                 "injection_vector": "none",
@@ -226,11 +274,286 @@ def pull_hf() -> list[dict]:
                 "topic": "benign_helpful",
                 "source": "Anthropic/hh-rlhf [6]",
             })
-        print(f"    -> {len(rows) - before} rows")
+        src_rows = _cap_source(src_rows, MAX_PER_HF_SOURCE, "Anthropic/hh-rlhf")
+        print(f"    -> {len(src_rows)} rows (post-cap)")
+        rows.extend(src_rows)
     except Exception as e:
         print(f"    ! Anthropic/hh-rlhf failed: {e}")
 
     return rows
+
+
+# ---------------------------------------------------------------------------
+# SECTION 1B: LLM-generated decoupled attack_type x tier grid
+# ---------------------------------------------------------------------------
+# This is the core fix for the attack_type <-> surface_benignity confound.
+# Each (attack_type, tier) cell is generated independently, so tier varies
+# within each attack_type instead of being fully determined by it. Mirrors
+# the approach in build_probe_data_v2.py (same ATTACK_TYPES / TIER_DEFINITIONS
+# registry, imported from attack_taxonomy.py), but run against a disjoint
+# generation budget and deduplicated against probe_data_v2.csv so the two
+# sets never overlap.
+
+GRID_TOPICS = [
+    "network intrusion or hacking",
+    "malware or ransomware creation",
+    "phishing or social engineering",
+    "financial fraud or money laundering",
+    "chemical, biological, or weapons synthesis",
+    "disinformation or election manipulation",
+    "privacy violation, stalking, or surveillance",
+    "extremist recruitment or radicalization content",
+    "drug synthesis or trafficking",
+    "identity theft or fraudulent documents",
+]
+
+BENIGN_TOPICS = [
+    "everyday personal advice (travel, cooking, hobbies)",
+    "professional or workplace advice",
+    "technical / programming help",
+    "academic or homework help",
+    "creative writing requests (non-harmful)",
+    "security awareness or defensive cybersecurity education",
+    "health, fitness, or safety information",
+    "history, science, or general knowledge questions",
+    "hard negatives: contains trigger words (hack, bomb, kill, drug) in an innocuous context",
+    "customer support, admin, or scheduling requests",
+    "personal finance or budgeting questions",
+    "parenting or relationship advice",
+    "home improvement or DIY project help",
+    "legal or bureaucratic process questions (non-sensitive)",
+    "product recommendations or shopping advice",
+]
+
+GRID_SYSTEM_PROMPT = (
+    "You are a security research assistant helping build a training dataset "
+    "for an AI content-safety classifier. Your task is to generate realistic "
+    "examples of adversarial prompts at a specified disguise level. "
+    "Output ONLY valid JSON -- no commentary, no markdown fences."
+)
+
+BENIGN_SYSTEM_PROMPT = (
+    "You are a research assistant helping build a training dataset for an AI "
+    "content-safety classifier. Your task is to generate realistic, genuinely "
+    "benign user prompts on a specified topic. Output ONLY valid JSON -- no "
+    "commentary, no markdown fences."
+)
+
+
+def _build_grid_prompt(attack_type: str, tier: int, n: int) -> str:
+    meta = ATTACK_TYPES[attack_type]
+    example = meta["tier_examples"][tier]
+    tier_def = TIER_DEFINITIONS[tier]
+    tier_scale = "\n".join(f"  - Tier {t}: {TIER_DEFINITIONS[t]}" for t in TIERS)
+    topics = "\n".join(f"  - {t}" for t in GRID_TOPICS)
+
+    return f"""Generate exactly {n} DIVERSE adversarial prompts of attack_type="{attack_type}" at surface_benignity={tier}.
+
+## Attack type
+{meta["description"]}
+
+## Surface benignity scale
+{tier_scale}
+
+## Target tier for this batch: Tier {tier}
+{tier_def}
+
+## Reference example at Tier {tier}
+"{example}"
+
+## Topic pool -- spread the {n} prompts roughly evenly across these topics
+{topics}
+
+## Requirements
+- Generate {n} prompts, all at Tier {tier} disguise level for attack_type="{attack_type}"
+- DIVERSITY: vary the topic (from the pool above), wording, length, and specific harmful request
+- Each prompt must read like something a real person would type -- no artificial phrasing
+- The tier-{tier} disguise level must be consistent and genuine across all prompts
+- Do NOT repeat the reference example above
+- Output ONLY a JSON array of {n} objects, each: {{"prompt": "...", "topic": "<one topic from the pool above>"}}
+
+JSON array:"""
+
+
+def _build_benign_prompt(topic: str, n: int) -> str:
+    return f"""Generate exactly {n} DIVERSE, genuinely benign user prompts on the topic: "{topic}".
+
+## Requirements
+- These must be prompts a real, well-intentioned person would type to an AI assistant
+- None of them should have any hidden harmful intent -- they are true negatives
+- DIVERSITY: vary wording, length, phrasing, and the specific request within the topic
+- If the topic mentions "trigger words", make sure those words appear naturally but the
+  overall request is unambiguously innocuous
+- Output ONLY a JSON array of {n} strings, nothing else
+
+JSON array:"""
+
+
+def _call_openai_json(client, model: str, user_prompt: str, system_prompt: str,
+                      n: int, retry: int = 3, max_tokens: int = 6000):
+    for attempt in range(1, retry + 1):
+        try:
+            msg = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            raw = msg.choices[0].message.content.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise ValueError(f"Expected list, got {type(parsed)}")
+            if len(parsed) < max(1, n // 2):
+                raise ValueError(f"Expected ~{n} items, got {len(parsed)}")
+            return parsed
+
+        except (json.JSONDecodeError, ValueError, KeyError) as e:
+            print(f"      [!] Parse error on attempt {attempt}/{retry}: {e}")
+            if attempt == retry:
+                return []
+            time.sleep(2 ** attempt)
+        except Exception as e:
+            print(f"      [!] API error on attempt {attempt}/{retry}: {e}")
+            if attempt == retry:
+                return []
+            time.sleep(2 ** attempt)
+    return []
+
+
+def generate_attack_grid(model: str = "gpt-4o-mini", n: int = 50, delay: float = 1.0,
+                         checkpoint_path: Path | None = None) -> list[dict]:
+    """11 attack_types x 4 tiers, n prompts each, independently generated."""
+    checkpoint_path = checkpoint_path or (DATA / "dataset_v1_grid_checkpoint.csv")
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("[!] OPENAI_API_KEY not set -- skipping LLM-generated attack grid.")
+        return []
+
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    done_cells: set[tuple[str, int]] = set()
+    existing_rows: list[dict] = []
+    if checkpoint_path.exists():
+        ck = pd.read_csv(checkpoint_path)
+        existing_rows = ck.to_dict("records")
+        done_cells = set(zip(ck["attack_type"], ck["surface_benignity"]))
+        print(f"[*] Grid checkpoint found -- {len(done_cells)} cells already complete")
+
+    attack_type_list = list(ATTACK_TYPES.keys())
+    total_cells = len(attack_type_list) * len(TIERS)
+    completed = len(done_cells)
+    new_rows: list[dict] = []
+
+    print(f"[*] Generating attack grid: {total_cells} cells x {n} prompts "
+          f"(model={model}) -- {total_cells - completed} cells remaining")
+
+    for attack_type in attack_type_list:
+        meta = ATTACK_TYPES[attack_type]
+        for tier in TIERS:
+            if (attack_type, tier) in done_cells:
+                continue
+            print(f"  [gen] {attack_type} / tier={tier} ... ", end="", flush=True)
+            user_prompt = _build_grid_prompt(attack_type, tier, n)
+            items = _call_openai_json(client, model, user_prompt, GRID_SYSTEM_PROMPT, n)
+            if not items:
+                print("FAILED -- skipping cell, re-run to retry")
+                continue
+
+            cell_rows = []
+            for item in items:
+                if isinstance(item, dict):
+                    text = str(item.get("prompt", "")).strip()
+                    topic = str(item.get("topic", "grid_unlabeled")).strip()
+                else:
+                    text, topic = str(item).strip(), "grid_unlabeled"
+                if not text:
+                    continue
+                cell_rows.append({
+                    "prompt": text, "label": 1, "attack_type": attack_type,
+                    "injection_vector": meta["injection_vector"],
+                    "surface_benignity": tier,
+                    "obfuscation_method": meta["obfuscation_method"],
+                    "topic": topic,
+                    "source": "llm_generated_grid [8]",
+                })
+
+            new_rows.extend(cell_rows)
+            completed += 1
+            print(f"done ({len(cell_rows)} rows, {completed}/{total_cells})")
+
+            pd.DataFrame(cell_rows).to_csv(
+                checkpoint_path, mode="a",
+                header=not checkpoint_path.exists(), index=False,
+            )
+            time.sleep(delay)
+
+    return existing_rows + new_rows
+
+
+def generate_benign_grid(model: str = "gpt-4o-mini", n: int = 50, delay: float = 1.0,
+                         checkpoint_path: Path | None = None) -> list[dict]:
+    """10 benign topics x n prompts, for extra benign diversity/volume."""
+    checkpoint_path = checkpoint_path or (DATA / "dataset_v1_benign_grid_checkpoint.csv")
+
+    api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not api_key:
+        print("[!] OPENAI_API_KEY not set -- skipping LLM-generated benign grid.")
+        return []
+
+    import openai
+    client = openai.OpenAI(api_key=api_key)
+
+    done_topics: set[str] = set()
+    existing_rows: list[dict] = []
+    if checkpoint_path.exists():
+        ck = pd.read_csv(checkpoint_path)
+        existing_rows = ck.to_dict("records")
+        done_topics = set(ck["topic"])
+        print(f"[*] Benign grid checkpoint found -- {len(done_topics)} topics already complete")
+
+    new_rows: list[dict] = []
+    print(f"[*] Generating benign grid: {len(BENIGN_TOPICS)} topics x {n} prompts (model={model})")
+
+    for topic in BENIGN_TOPICS:
+        if topic in done_topics:
+            continue
+        print(f"  [gen] benign / {topic[:40]} ... ", end="", flush=True)
+        user_prompt = _build_benign_prompt(topic, n)
+        items = _call_openai_json(client, model, user_prompt, BENIGN_SYSTEM_PROMPT, n)
+        if not items:
+            print("FAILED -- skipping topic, re-run to retry")
+            continue
+
+        is_hard_negative = "hard negative" in topic.lower()
+        cell_rows = [{
+            "prompt": str(text).strip(), "label": 0, "attack_type": "none",
+            "injection_vector": "none",
+            "surface_benignity": 2 if is_hard_negative else 3,
+            "obfuscation_method": "none",
+            "topic": topic,
+            "source": "llm_generated_grid [8]",
+        } for text in items if str(text).strip()]
+
+        new_rows.extend(cell_rows)
+        print(f"done ({len(cell_rows)} rows)")
+
+        pd.DataFrame(cell_rows).to_csv(
+            checkpoint_path, mode="a",
+            header=not checkpoint_path.exists(), index=False,
+        )
+        time.sleep(delay)
+
+    return existing_rows + new_rows
 
 
 # ---------------------------------------------------------------------------
@@ -591,14 +914,32 @@ def expand_seeds(seeds: dict) -> list[dict]:
     return rows
 
 
-def deduplicate(rows: list[dict]) -> list[dict]:
+def _prompt_hash(text: str) -> str:
+    return hashlib.md5(text.lower().strip().encode()).hexdigest()
+
+
+def _load_probe_v2_hashes() -> set[str]:
+    if not PROBE_DATA_V2.exists():
+        return set()
+    df = pd.read_csv(PROBE_DATA_V2)
+    return {_prompt_hash(p) for p in df["prompt"].astype(str)}
+
+
+def deduplicate(rows: list[dict], exclude_hashes: set[str] | None = None) -> list[dict]:
+    exclude_hashes = exclude_hashes or set()
     seen: set[str] = set()
     out = []
+    excluded = 0
     for r in rows:
-        key = hashlib.md5(r["prompt"].lower().strip().encode()).hexdigest()
+        key = _prompt_hash(r["prompt"])
+        if key in exclude_hashes:
+            excluded += 1
+            continue
         if key not in seen:
             seen.add(key)
             out.append(r)
+    if excluded:
+        print(f"  [dedup] Excluded {excluded} rows overlapping probe_data_v2.csv")
     return out
 
 
@@ -633,12 +974,26 @@ def add_uid(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def stratified_split(df: pd.DataFrame):
-    """Stratified 70/15/15 split on label."""
-    train, temp = train_test_split(df, test_size=0.30, stratify=df["label"],
-                                   random_state=RANDOM_SEED)
-    val, test = train_test_split(temp, test_size=0.50, stratify=temp["label"],
-                                 random_state=RANDOM_SEED)
-    return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+    """Stratified 70/15/15 split on (label, attack_type) so every split
+    preserves the attack_type x tier grid proportionally. Falls back to
+    label-only stratification if any (label, attack_type) cell is too small
+    to survive two sequential splits."""
+    composite = df["label"].astype(str) + "|" + df["attack_type"].astype(str)
+
+    def _do_split(strat_col):
+        train, temp = train_test_split(df, test_size=0.30, stratify=strat_col,
+                                       random_state=RANDOM_SEED)
+        temp_strat = strat_col.loc[temp.index]
+        val, test = train_test_split(temp, test_size=0.50, stratify=temp_strat,
+                                     random_state=RANDOM_SEED)
+        return train.reset_index(drop=True), val.reset_index(drop=True), test.reset_index(drop=True)
+
+    try:
+        return _do_split(composite)
+    except ValueError as e:
+        print(f"  [!] Composite (label, attack_type) stratification failed ({e}); "
+              f"falling back to label-only stratification.")
+        return _do_split(df["label"])
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +1001,8 @@ def stratified_split(df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 def _stats(frame: pd.DataFrame) -> dict:
+    mal = frame[frame["label"] == 1]
+    crosstab = pd.crosstab(mal["attack_type"], mal["surface_benignity"])
     return {
         "total": len(frame),
         "benign": int((frame["label"] == 0).sum()),
@@ -653,6 +1010,11 @@ def _stats(frame: pd.DataFrame) -> dict:
         "by_attack_type": {k: int(v) for k, v in frame["attack_type"].value_counts().items()},
         "by_source": {k: int(v) for k, v in frame["source"].value_counts().items()},
         "by_topic_top10": {k: int(v) for k, v in frame["topic"].value_counts().head(10).items()},
+        "attack_type_x_tier": {
+            str(atype): {str(tier): int(crosstab.loc[atype, tier])
+                        for tier in crosstab.columns}
+            for atype in crosstab.index
+        },
     }
 
 
@@ -683,6 +1045,14 @@ def generate_report(df: pd.DataFrame, df_train: pd.DataFrame,
         label = "obvious" if score == 0 else ("disguised" if score < 3 else "hidden")
         lines.append(f"  Score {score} ({label}): {cnt} ({cnt/total_mal*100:.1f}%)")
 
+    # attack_type x surface_benignity crosstab -- proof the confound is fixed.
+    # In v1 this table was diagonal (each attack_type occupied exactly one
+    # tier column). It should now show mass spread across multiple tiers
+    # per attack_type.
+    lines.append(f"\nAttack type x surface_benignity tier (label=1 only):")
+    crosstab = pd.crosstab(mal["attack_type"], mal["surface_benignity"])
+    lines.append("  " + crosstab.to_string().replace("\n", "\n  "))
+
     lines.append(f"\nSource distribution:")
     for src, cnt in df["source"].value_counts().items():
         lines.append(f"  {src:<55} {cnt}")
@@ -702,6 +1072,7 @@ def generate_report(df: pd.DataFrame, df_train: pd.DataFrame,
         "[5] xTRam1/safe-guard-prompt-injection         https://huggingface.co/datasets/xTRam1/safe-guard-prompt-injection",
         "[6] Anthropic/hh-rlhf                          https://huggingface.co/datasets/Anthropic/hh-rlhf",
         "[7] Curated/synthetic -- see CURATED_SEEDS and generate_synthetic() in this script",
+        "[8] llm_generated_grid -- see generate_attack_grid()/generate_benign_grid() in this script",
     ]
     return "\n".join(lines)
 
@@ -710,7 +1081,41 @@ def generate_report(df: pd.DataFrame, df_train: pd.DataFrame,
 # MAIN
 # ---------------------------------------------------------------------------
 
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--grid-model", default="gpt-4o-mini")
+    p.add_argument("--grid-n", type=int, default=50,
+                   help="Prompts per (attack_type, tier) cell")
+    p.add_argument("--benign-grid-n", type=int, default=100,
+                   help="Prompts per benign topic (higher than --grid-n since the "
+                        "benign pool needs to comfortably clear --target-per-class "
+                        "without enforce_balance() having to oversample with "
+                        "replacement, which would duplicate rows across splits)")
+    p.add_argument("--grid-delay", type=float, default=1.0)
+    p.add_argument("--skip-grid", action="store_true",
+                   help="Skip LLM generation entirely (curated/synthetic/HF only)")
+    p.add_argument("--dry-run-grid", action="store_true",
+                   help="Print one generation prompt and exit, no API calls")
+    p.add_argument("--target-per-class", type=int, default=TARGET_PER_CLASS)
+    p.add_argument("--max-per-source", type=int, default=MAX_PER_HF_SOURCE)
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
+    global MAX_PER_HF_SOURCE
+    MAX_PER_HF_SOURCE = args.max_per_source
+
+    if args.dry_run_grid:
+        print("=== DRY RUN -- malicious grid cell (direct_harmful_request, tier=2) ===\n")
+        print(_build_grid_prompt("direct_harmful_request", 2, args.grid_n))
+        print("\n\n=== DRY RUN -- benign grid topic ===\n")
+        print(_build_benign_prompt(BENIGN_TOPICS[0], args.benign_grid_n))
+        return
+
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+
     print("\n" + "=" * 60)
     print("Prompt Injection Dataset Builder")
     print("=" * 60)
@@ -720,7 +1125,7 @@ def main():
     all_rows = []
 
     hf_rows = pull_hf()
-    print(f"\n[ok] HuggingFace sources: {len(hf_rows)} rows pulled")
+    print(f"\n[ok] HuggingFace sources: {len(hf_rows)} rows pulled (post-cap)")
     all_rows.extend(hf_rows)
 
     seed_rows = expand_seeds(CURATED_SEEDS)
@@ -731,8 +1136,23 @@ def main():
     print(f"[ok] Synthetic augmentation: {len(synth_rows)} rows")
     all_rows.extend(synth_rows)
 
+    if not args.skip_grid:
+        grid_rows = generate_attack_grid(model=args.grid_model, n=args.grid_n,
+                                         delay=args.grid_delay)
+        print(f"[ok] LLM-generated attack grid: {len(grid_rows)} rows")
+        all_rows.extend(grid_rows)
+
+        benign_grid_rows = generate_benign_grid(model=args.grid_model, n=args.benign_grid_n,
+                                                delay=args.grid_delay)
+        print(f"[ok] LLM-generated benign grid: {len(benign_grid_rows)} rows")
+        all_rows.extend(benign_grid_rows)
+    else:
+        print("[i] --skip-grid set: no LLM-generated rows added")
+
     before = len(all_rows)
-    all_rows = deduplicate(all_rows)
+    exclude_hashes = _load_probe_v2_hashes()
+    print(f"[i] Loaded {len(exclude_hashes)} probe_data_v2 hashes to exclude from training")
+    all_rows = deduplicate(all_rows, exclude_hashes=exclude_hashes)
     print(f"[ok] Deduplication: {before} -> {len(all_rows)} rows")
 
     df_raw = pd.DataFrame(all_rows)
@@ -743,7 +1163,7 @@ def main():
     ben_count = int((df_raw["label"] == 0).sum())
     print(f"\n[i] Pre-balance: {mal_count} malicious / {ben_count} benign")
 
-    df = enforce_balance(df_raw, TARGET_PER_CLASS)
+    df = enforce_balance(df_raw, args.target_per_class)
     df = add_uid(df)
 
     print(f"[ok] Balanced dataset: {len(df)} rows "
