@@ -50,4 +50,7 @@ probe_data/
 # Probe results (large, reproducible)
 results/
 
+# Local backup of pre-decoupling (confounded) v1 artifacts
+backup_v1_confounded/
+
 push_to_hf.py
