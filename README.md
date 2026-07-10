@@ -11,7 +11,7 @@ pinned: false
 
 SentinelAI is a machine learning system that detects malicious intent in natural language prompts before they reach a downstream AI model. It targets a specific class of attack where harmful requests are embedded inside socially or professionally plausible framing — role-play scenarios, educational justifications, hypothetical contexts — that bypass surface-level keyword filters entirely.
 
-The system classifies prompts semantically rather than lexically, using fine-tuned transformer models trained on a curated dataset of ~3,000 prompts covering nine jailbreak attack categories. It was developed as a practical implementation of the **Prompt Injection Testing AI-ASCT** from the CAIMOM-Aligned Catalogue, positioned as a pre-inference gate that intercepts and classifies prompts before a downstream LLM processes them.
+The system classifies prompts semantically rather than lexically, using fine-tuned transformer models trained on a curated dataset of ~4,000 prompts covering fourteen jailbreak attack categories, each spanning a full range of disguise levels (surface_benignity tiers 0-3) rather than one fixed tier per category. It was developed as a practical implementation of the **Prompt Injection Testing AI-ASCT** from the CAIMOM-Aligned Catalogue, positioned as a pre-inference gate that intercepts and classifies prompts before a downstream LLM processes them.
 
 ---
 
@@ -27,9 +27,9 @@ No setup required. Enter any prompt, select a model, and click **Analyze Prompt*
 
 | Model | Size | F1 | ROC-AUC | Notes |
 |---|---|---|---|---|
-| DistilBERT v1 | 256 MB | 0.972 | 0.997 | Default — best size/accuracy trade-off |
-| RoBERTa v1 | 476 MB | 0.978 | 0.998 | Highest accuracy |
-| TF-IDF + LR | 0.5 MB | 0.946 | 0.990 | Classical NLP baseline |
+| DistilBERT v1 | 256 MB | 0.974 | 0.996 | Default — best size/accuracy trade-off |
+| RoBERTa v1 | 476 MB | 0.981 | 0.998 | Highest accuracy |
+| TF-IDF + LR | 0.5 MB | 0.954 | 0.990 | Classical NLP baseline |
 
 Both transformer models are fine-tuned from HuggingFace pre-trained checkpoints. All three are served simultaneously and can be compared side by side in the UI.
 
@@ -170,7 +170,7 @@ python scripts/evaluation.py
 
 All randomness is fixed at `RANDOM_SEED=42`. Re-running the pipeline on the same source data produces identical results.
 
-> **Offline fallback**: if HuggingFace is unavailable, `build_dataset.py` skips those sources and builds from the curated seeds and synthetic templates only (~300 rows). Training will still work but metrics will be lower. Run with internet access for the full ~3,000-row corpus.
+> **Offline fallback**: if HuggingFace is unavailable, `build_dataset.py` skips those sources and builds from the curated seeds, synthetic templates, and LLM-generated grid only. Training will still work but source diversity will be lower. Run with internet access for the full ~4,000-row corpus. The LLM-generated attack_type x tier grid additionally requires `OPENAI_API_KEY` in `.env`.
 
 ---
 
@@ -183,13 +183,14 @@ sentinelai/
 │   └── static/
 │       └── index.html             # Single-page web UI
 ├── scripts/
-│   ├── build_dataset.py           # Stage A: unified dataset builder (HF + curated + synthetic)
+│   ├── build_dataset.py           # Stage A: unified dataset builder (HF + curated + synthetic + LLM grid)
+│   ├── attack_taxonomy.py         # Shared attack_type x tier registry (used by build_dataset.py and build_probe_data_v2.py)
 │   ├── train_baseline.py          # Stage B: TF-IDF + Logistic Regression
 │   ├── train_distilbert.py        # Stage B: DistilBERT / RoBERTa fine-tuning
 │   ├── classifier.py              # Inference wrapper (IntentClassifier)
 │   └── evaluation.py              # Model-agnostic evaluation harness
 ├── data/                          # Generated at runtime by build_dataset.py
-│   ├── dataset_v1.csv             # Full balanced dataset (~3,000 rows)
+│   ├── dataset_v1.csv             # Full balanced dataset (~4,000 rows)
 │   ├── dataset_v1_train.csv       # 70% stratified split
 │   ├── dataset_v1_val.csv         # 15% stratified split
 │   ├── dataset_v1_test.csv        # 15% stratified split
@@ -210,18 +211,21 @@ sentinelai/
 
 | Source | Role | Size | Licence |
 |---|---|---|---|
-| jackhhao/jailbreak-classification | Both | ~1,400 prompts | CC-BY |
-| rubend18/ChatGPT-Jailbreak-Prompts | Malicious | variable | Open |
-| allenai/wildjailbreak | Malicious | up to 1,000 | Apache 2.0 |
-| deepset/prompt-injections | Both | variable | Apache 2.0 |
-| xTRam1/safe-guard-prompt-injection | Both | variable | MIT |
-| Anthropic/hh-rlhf (helpful split) | Benign | up to 2,000 | MIT |
+| jackhhao/jailbreak-classification | Both | capped at 300 | CC-BY |
+| rubend18/ChatGPT-Jailbreak-Prompts | Malicious | capped at 300 | Open |
+| allenai/wildjailbreak | Malicious | capped at 300 (gated — requires HF auth) | Apache 2.0 |
+| deepset/prompt-injections | Both | capped at 300 | Apache 2.0 |
+| xTRam1/safe-guard-prompt-injection | Both | capped at 300 | MIT |
+| Anthropic/hh-rlhf (helpful split) | Benign | capped at 300 | MIT |
 | Curated handcrafted seeds | Both | ~130 prompts | Author-original |
 | Synthetic template augmentation | Malicious | ~120 prompts | Author-original |
+| LLM-generated attack_type x tier grid | Both | ~2,800 prompts | Author-original |
 
-Attack categories covered: `direct_harmful_request`, `fictional_framing`, `persona_jailbreak`, `indirect_rag_injection`, `authority_claim`, `obfuscated_payload`, `goal_hijacking`, `adversarial_jailbreak`, `prompt_injection`.
+Each scraped HF source is capped (`--max-per-source`, default 300) so no single source can dominate a class — in the original dataset, one source alone made up 66% of all rows.
 
-Final corpus: ~3,000 prompts at a strict 50/50 benign-to-malicious ratio (oversamples minority class if needed), stratified 70/15/15 train/val/test split.
+Attack categories covered: `direct_harmful_request`, `fictional_framing`, `hypothetical_framing`, `persona_jailbreak`, `authority_claim`, `indirect_rag_injection`, `obfuscated_payload`, `completion_hijack`, `goal_hijacking`, `payload_splitting`, `camouflaged_harmful`, plus the legacy single-tier categories `injection`, `jailbreak_explicit`, `prompt_injection`.
+
+Final corpus: ~4,000 prompts at a strict 50/50 benign-to-malicious ratio, stratified 70/15/15 train/val/test split (stratified on label + attack_type). Each of the 11 LLM-generated attack categories spans all 4 `surface_benignity` tiers (0=obvious to 3=heavily disguised) instead of one fixed tier per category — see `data/dataset_stats.txt` for the attack_type x tier crosstab.
 
 ---
 

@@ -4,7 +4,7 @@ run_attack_type_confusion.py
 Produces two per-attack-type confusion tables from already-computed reports.
 No model inference is re-run.
 
-Table A — In-distribution (dataset_v1_test.csv, 8 malicious attack types)
+Table A — In-distribution (dataset_v1_test.csv, 14 malicious attack types)
     Source: reports/{model}_report.json
 
 Table B — Out-of-distribution (probe_data_v2.csv, 11 attack types)
@@ -40,16 +40,26 @@ OOD_REPORTS = {
     "TF-IDF+LR":  ROOT / "reports" / "stratified" / "baseline_tfidf_report.json",
 }
 
-# Fixed display order for each table
+# Fixed display order for each table.
+# IN_DIST_ORDER now covers all 14 attack_types present in the decoupled
+# dataset_v1_test: the 3 legacy real-world-sourced types (single tier each,
+# unchanged) plus the 11 LLM-generated grid types (same order as OOD_ORDER,
+# for direct row-by-row comparison against Table B).
 IN_DIST_ORDER = [
     "injection",
     "jailbreak_explicit",
     "prompt_injection",
-    "indirect_rag_injection",
-    "fictional_framing",
-    "authority_claim",
     "persona_jailbreak",
+    "indirect_rag_injection",
+    "goal_hijacking",
+    "authority_claim",
     "direct_harmful_request",
+    "obfuscated_payload",
+    "completion_hijack",
+    "fictional_framing",
+    "payload_splitting",
+    "hypothetical_framing",
+    "camouflaged_harmful",
 ]
 
 OOD_ORDER = [
@@ -141,6 +151,7 @@ def build_table_a(reports: dict[str, dict]) -> tuple[str, dict]:
     # Benign FP row — sourced from "none" group
     fp_cells = []
     fp_data: dict[str, dict] = {}
+    neg_ref = None
     for mname, report in reports.items():
         pat = report["per_attack_type"]
         if "none" not in pat:
@@ -148,10 +159,12 @@ def build_table_a(reports: dict[str, dict]) -> tuple[str, dict]:
             continue
         m = pat["none"]
         fp, neg, spec = _fp_cell(m)
+        neg_ref = neg
         fp_cells.append(f"{fp} FP / {neg} ({spec * 100:.1f}% spec)" if spec is not None else "—")
         fp_data[mname] = {"false_positives": fp, "total_benign": neg, "specificity": spec}
 
-    lines.append("| **none (benign)** | 225 | " + " | ".join(fp_cells) + " |")
+    neg_str = str(neg_ref) if neg_ref is not None else "—"
+    lines.append("| **none (benign)** | " + neg_str + " | " + " | ".join(fp_cells) + " |")
     data_out["none_benign"] = fp_data
 
     return "\n".join(lines), data_out
@@ -207,16 +220,20 @@ def main():
     table_a_md, table_a_data = build_table_a(in_dist)
     table_b_md, table_b_data = build_table_b(ood)
 
+    table_a_n = next(iter(in_dist.values()))["headline"]["n"]
+    table_b_n = next(iter(ood.values()))["headline"]["n"]
+
     # Markdown output
     md_lines = [
         "# Per-attack-type detection — cross-model comparison\n",
 
-        "## Table A — In-distribution (dataset_v1_test, n=450)\n",
-        "Prompts drawn from the same seven sources used for training.",
+        f"## Table A — In-distribution (dataset_v1_test, n={table_a_n})\n",
+        "Prompts drawn from the decoupled attack_type x surface_benignity grid "
+        "plus capped real-world sources used for training.",
         "Cell format: `detected / total (recall%)`\n",
         table_a_md,
 
-        "\n## Table B — Out-of-distribution (probe_data_v2, n=440)\n",
+        f"\n## Table B — Out-of-distribution (probe_data_v2, n={table_b_n})\n",
         "Novel GPT-generated prompts, none seen during training.",
         "All samples are malicious (no benign baseline for this table).",
         "Cell format: `detected / total (recall%)`\n",
@@ -231,12 +248,12 @@ def main():
     payload = {
         "table_a_in_distribution": {
             "source": "dataset_v1_test.csv",
-            "n": 450,
+            "n": table_a_n,
             "results": table_a_data,
         },
         "table_b_out_of_distribution": {
             "source": "probe_data_v2.csv",
-            "n": 440,
+            "n": table_b_n,
             "results": table_b_data,
         },
     }
