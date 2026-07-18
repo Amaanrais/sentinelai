@@ -55,19 +55,11 @@ ALL_MODELS: list[dict] = [
         "provider": "google",
         "model_id": "gemini-2.5-flash",
         "env_key":  "GOOGLE_API_KEY",
-    },
-    {
-        "label":    "anthropic",
-        "provider": "anthropic",
-        "model_id": "claude-sonnet-4-6",
-        "env_key":  "ANTHROPIC_API_KEY",
-    },
-    {
-        "label":    "deepseek",
-        "provider": "openai_compat",
-        "model_id": "deepseek-chat",
-        "env_key":  "DEEPSEEK_API_KEY",
-        "base_url": "https://api.deepseek.com/v1",
+        # gemini-2.5-flash spends output tokens on hidden "thinking" before the
+        # visible answer; at the default 512-token budget that left ~20 tokens
+        # for the actual reply. Disabling thinking (supported on this model)
+        # frees the whole budget for the answer.
+        "thinking_budget": 0,
     },
     {
         "label":    "kimi-k2",
@@ -81,13 +73,20 @@ ALL_MODELS: list[dict] = [
         "provider": "google",
         "model_id": "gemma-4-31b-it",
         "env_key":  "GOOGLE_API_KEY",
+        # Unlike gemini-2.5-flash, this model rejects thinking_config
+        # ("Thinking budget is not supported for this model"), so thinking
+        # can't be disabled. It reliably burns ~500-560 tokens on hidden
+        # reasoning, so give it a floor well above that regardless of
+        # --max-tokens, or the visible answer gets truncated to near-empty.
+        "min_max_tokens": 2048,
     },
 ]
 
 CSV_FIELDS = [
     "prompt_id", "prompt", "label", "attack_type", "injection_vector",
     "surface_benignity", "obfuscation_method", "tier", "multi_turn_group",
-    "model", "model_id", "response", "latency_s", "error", "timestamp",
+    "model", "model_id", "response", "latency_s", "finish_reason", "error",
+    "timestamp",
 ]
 
 
@@ -133,28 +132,47 @@ def _call_anthropic(model_id: str, prompt: str, api_key: str, max_tokens: int) -
     return resp.content[0].text
 
 
-def _call_google(model_id: str, prompt: str, api_key: str, max_tokens: int) -> str:
+def _call_google(
+    model_id: str,
+    prompt: str,
+    api_key: str,
+    max_tokens: int,
+    thinking_budget: int | None = None,
+    min_max_tokens: int | None = None,
+) -> tuple[str, str]:
+    """Returns (text, finish_reason)."""
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=api_key)
+
+    effective_max_tokens = max(max_tokens, min_max_tokens or 0)
+    config_kwargs: dict = {
+        "system_instruction": SYSTEM_PROMPT,
+        "max_output_tokens": effective_max_tokens,
+    }
+    if thinking_budget is not None:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+
     resp = client.models.generate_content(
         model=model_id,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=max_tokens,
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
-    return resp.text or ""
+    finish_reason = ""
+    if resp.candidates:
+        fr = resp.candidates[0].finish_reason
+        finish_reason = fr.name if fr is not None else ""
+    return resp.text or "", finish_reason
 
 
-def _dispatch(cfg: dict, prompt: str, max_tokens: int) -> str:
+def _dispatch(cfg: dict, prompt: str, max_tokens: int) -> tuple[str, str]:
+    """Returns (text, finish_reason). finish_reason is '' for non-Google providers."""
     api_key  = os.environ[cfg["env_key"]]
     provider = cfg["provider"]
     model_id = cfg["model_id"]
 
     if provider == "openai":
-        return _call_openai_sdk(model_id, prompt, api_key, max_tokens)
+        return _call_openai_sdk(model_id, prompt, api_key, max_tokens), ""
 
     if provider == "openai_compat":
         # OpenRouter requires identifying headers for better rate limits
@@ -166,28 +184,33 @@ def _dispatch(cfg: dict, prompt: str, max_tokens: int) -> str:
         return _call_openai_sdk(
             model_id, prompt, api_key, max_tokens,
             base_url=cfg["base_url"], extra_headers=headers,
-        )
+        ), ""
 
     if provider == "anthropic":
-        return _call_anthropic(model_id, prompt, api_key, max_tokens)
+        return _call_anthropic(model_id, prompt, api_key, max_tokens), ""
 
     if provider == "google":
-        return _call_google(model_id, prompt, api_key, max_tokens)
+        return _call_google(
+            model_id, prompt, api_key, max_tokens,
+            thinking_budget=cfg.get("thinking_budget"),
+            min_max_tokens=cfg.get("min_max_tokens"),
+        )
 
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 3) -> tuple[str, str]:
-    """Returns (response, error). On success error is '', on failure response is ''."""
+def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 3) -> tuple[str, str, str]:
+    """Returns (response, finish_reason, error). On success error is '', on failure response is ''."""
     last_err = ""
     for attempt in range(retries):
         try:
-            return _dispatch(cfg, prompt, max_tokens), ""
+            response, finish_reason = _dispatch(cfg, prompt, max_tokens)
+            return response, finish_reason, ""
         except Exception as exc:
             last_err = f"{type(exc).__name__}: {exc}"
             if attempt < retries - 1:
                 time.sleep(2 ** (attempt + 1))  # 2 s, then 4 s
-    return "", last_err
+    return "", "", last_err
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +305,7 @@ def main() -> None:
                 tqdm(prompts, desc=f"{model_cfg['label']:12s}", unit="prompt", leave=True)
             ):
                 t0 = time.perf_counter()
-                response, error = _call_with_retry(model_cfg, row["prompt"], args.max_tokens)
+                response, finish_reason, error = _call_with_retry(model_cfg, row["prompt"], args.max_tokens)
                 latency = round(time.perf_counter() - t0, 3)
 
                 writer.writerow({
@@ -299,6 +322,7 @@ def main() -> None:
                     "model_id":         model_cfg["model_id"],
                     "response":         response,
                     "latency_s":        latency,
+                    "finish_reason":    finish_reason,
                     "error":            error,
                     "timestamp":        datetime.now(timezone.utc).isoformat(),
                 })

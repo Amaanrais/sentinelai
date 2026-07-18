@@ -327,8 +327,8 @@ def save_report(report: EvaluationReport, out_dir: Path) -> dict[str, Path]:
         "calibration": report.calibration,
         "top_misclassified": report.top_misclassified,
     }
-    json_path.write_text(json.dumps(payload, indent=2))
-    md_path.write_text(render_markdown(report))
+    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    md_path.write_text(render_markdown(report), encoding="utf-8")
     return {"json": json_path, "markdown": md_path}
 
 
@@ -342,3 +342,141 @@ def compare_reports(reports: Iterable[EvaluationReport]) -> str:
         row = [k] + [_fmt(getattr(r.headline, k)) for r in reports]
         lines.append("| " + " | ".join(row) + " |")
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Cross-validation aggregation
+#
+# aggregate_cv_reports() takes the k per-fold EvaluationReports produced by
+# scripts/cross_validate.py (one model architecture, rotating validation
+# fold) and turns them into a mean/std/95%-CI summary. See
+# reports/cross_validation_plan.md for the design this implements.
+# --------------------------------------------------------------------------- #
+
+CV_HEADLINE_METRICS = ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")
+
+
+def _mean_std_ci(values: list[float | None]) -> dict[str, float | int | None]:
+    values = [v for v in values if v is not None]
+    n = len(values)
+    if n == 0:
+        return {"mean": None, "std": None, "ci95_low": None, "ci95_high": None, "n_folds": 0}
+    mean = float(np.mean(values))
+    if n == 1:
+        return {"mean": mean, "std": 0.0, "ci95_low": mean, "ci95_high": mean, "n_folds": 1}
+    std = float(np.std(values, ddof=1))
+    from scipy.stats import t as t_dist
+    se = std / np.sqrt(n)
+    tcrit = float(t_dist.ppf(0.975, df=n - 1))
+    return {
+        "mean": mean, "std": std,
+        "ci95_low": mean - tcrit * se, "ci95_high": mean + tcrit * se,
+        "n_folds": n,
+    }
+
+
+def _aggregate_grouped_recall(group_reports: list[GroupedRecall]) -> dict[str, dict]:
+    """Average recall_on_positives / specificity_on_negatives per group across
+    folds where that group had support. Reports folds_with_support so a mean
+    over 2 folds isn't presented with the same confidence as a mean over 5."""
+    all_groups: dict[str, list[dict]] = defaultdict(list)
+    for gr in group_reports:
+        for grp, m in gr.by_group.items():
+            all_groups[grp].append(m)
+
+    out: dict[str, dict] = {}
+    for grp, entries in all_groups.items():
+        recalls = [e["recall_on_positives"] for e in entries if e["recall_on_positives"] is not None]
+        specs = [e["specificity_on_negatives"] for e in entries if e["specificity_on_negatives"] is not None]
+        out[grp] = {
+            "folds_with_support": len(entries),
+            "total_support": sum(e["support"] for e in entries),
+            "mean_recall_on_positives": float(np.mean(recalls)) if recalls else None,
+            "mean_specificity_on_negatives": float(np.mean(specs)) if specs else None,
+        }
+    return out
+
+
+def aggregate_cv_reports(model_name: str, reports: list[EvaluationReport]) -> dict:
+    """Aggregate k per-fold EvaluationReports into a mean/std/95%-CI summary.
+
+    All reports must come from the same model architecture evaluated on its
+    own rotating validation fold -- never mix reports across model types or
+    with the held-out test/probe evaluations."""
+    if not reports:
+        raise ValueError("aggregate_cv_reports() got an empty report list")
+
+    headline_summary = {
+        metric: _mean_std_ci([getattr(r.headline, metric) for r in reports])
+        for metric in CV_HEADLINE_METRICS
+    }
+
+    tier_reports = [r.per_benignity_tier for r in reports if r.per_benignity_tier is not None]
+
+    return {
+        "model_name": model_name,
+        "n_folds": len(reports),
+        "headline": headline_summary,
+        "per_attack_type": _aggregate_grouped_recall([r.per_attack_type for r in reports]),
+        "per_benignity_tier": (
+            _aggregate_grouped_recall(tier_reports) if tier_reports else None
+        ),
+        "per_fold_headline": [asdict(r.headline) for r in reports],
+    }
+
+
+def render_cv_markdown(summary: dict) -> str:
+    lines = [
+        f"# Cross-validation summary — {summary['model_name']}\n",
+        f"k = {summary['n_folds']} folds\n",
+        "## Headline metrics (mean ± std, 95% CI)\n",
+        "| metric | mean | std | 95% CI |",
+        "|---|---:|---:|---|",
+    ]
+    for metric, s in summary["headline"].items():
+        if s["mean"] is None:
+            lines.append(f"| {metric} | — | — | — |")
+        else:
+            ci = (f"[{s['ci95_low']:.3f}, {s['ci95_high']:.3f}]"
+                  if s["ci95_low"] is not None else "—")
+            lines.append(f"| {metric} | {s['mean']:.3f} | {s['std']:.3f} | {ci} |")
+
+    lines.append("\n## Per-fold headline metrics\n")
+    lines.append("| fold | accuracy | precision | recall | f1 | roc_auc | pr_auc |")
+    lines.append("|---:|---:|---:|---:|---:|---:|---:|")
+    for i, h in enumerate(summary["per_fold_headline"]):
+        lines.append(
+            f"| {i} | {_fmt(h['accuracy'])} | {_fmt(h['precision'])} | "
+            f"{_fmt(h['recall'])} | {_fmt(h['f1'])} | {_fmt(h['roc_auc'])} | {_fmt(h['pr_auc'])} |"
+        )
+
+    lines.append("\n## Per attack type (mean recall across folds with support)\n")
+    lines.append("| attack_type | folds w/ support | total support | mean recall (pos) | mean specificity (neg) |")
+    lines.append("|---|---:|---:|---:|---:|")
+    for grp, m in sorted(summary["per_attack_type"].items(), key=lambda kv: -kv[1]["total_support"]):
+        lines.append(
+            f"| {grp} | {m['folds_with_support']} | {m['total_support']} | "
+            f"{_fmt(m['mean_recall_on_positives'])} | {_fmt(m['mean_specificity_on_negatives'])} |"
+        )
+
+    if summary.get("per_benignity_tier"):
+        lines.append("\n## Per surface_benignity tier (mean recall across folds with support)\n")
+        lines.append("| tier | folds w/ support | total support | mean detection rate | mean specificity |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for grp, m in sorted(summary["per_benignity_tier"].items(), key=lambda kv: int(kv[0])):
+            lines.append(
+                f"| {grp} | {m['folds_with_support']} | {m['total_support']} | "
+                f"{_fmt(m['mean_recall_on_positives'])} | {_fmt(m['mean_specificity_on_negatives'])} |"
+            )
+
+    return "\n".join(lines)
+
+
+def save_cv_summary(summary: dict, out_dir: Path) -> dict[str, Path]:
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{summary['model_name']}_cv_summary.json"
+    md_path = out_dir / f"{summary['model_name']}_cv_summary.md"
+    json_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    md_path.write_text(render_cv_markdown(summary), encoding="utf-8")
+    return {"json": json_path, "markdown": md_path}
