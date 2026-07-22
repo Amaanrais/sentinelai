@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,9 @@ ALL_MODELS: list[dict] = [
         # for the actual reply. Disabling thinking (supported on this model)
         # frees the whole budget for the answer.
         "thinking_budget": 0,
+        # Google's free-tier API enforces a per-minute request cap. Throttle to
+        # 5 requests/minute (>=12 s between request starts) to stay under it.
+        "rpm": 5,
     },
     {
         "label":    "kimi-k2",
@@ -67,6 +71,11 @@ ALL_MODELS: list[dict] = [
         "model_id": "moonshotai/kimi-k2",
         "env_key":  "OPENROUTER_API_KEY",
         "base_url": "https://openrouter.ai/api/v1",
+        # OpenRouter throttles bursts and, under load, occasionally returns a
+        # blank 200 from the upstream provider. Proactively space requests to
+        # 10/minute (6 s apart) to reduce 429s; the retry layer recovers the
+        # rest (429s honour Retry-After, blank responses are retried).
+        "rpm": 10,
     },
     {
         "label":    "gemma-4",
@@ -79,6 +88,8 @@ ALL_MODELS: list[dict] = [
         # reasoning, so give it a floor well above that regardless of
         # --max-tokens, or the visible answer gets truncated to near-empty.
         "min_max_tokens": 2048,
+        # Shares the Google per-minute request cap; throttle to 5 requests/min.
+        "rpm": 5,
     },
 ]
 
@@ -94,6 +105,19 @@ CSV_FIELDS = [
 # Per-provider callers
 # ---------------------------------------------------------------------------
 
+# Per-request wall-clock cap so a hung upstream can't stall the whole run.
+REQUEST_TIMEOUT_S = 60.0
+
+
+class EmptyResponseError(RuntimeError):
+    """A provider returned no usable text (empty choices or blank content).
+
+    On OpenRouter this happens intermittently under load — the HTTP call is a
+    200 but the upstream provider returned nothing. Treated as retryable so a
+    transient blank doesn't get recorded as a permanent empty response.
+    """
+
+
 def _call_openai_sdk(
     model_id: str,
     prompt: str,
@@ -103,7 +127,7 @@ def _call_openai_sdk(
     extra_headers: dict | None = None,
 ) -> str:
     from openai import OpenAI
-    kwargs: dict = {"api_key": api_key}
+    kwargs: dict = {"api_key": api_key, "timeout": REQUEST_TIMEOUT_S, "max_retries": 0}
     if base_url:
         kwargs["base_url"] = base_url
     if extra_headers:
@@ -117,7 +141,13 @@ def _call_openai_sdk(
         ],
         max_tokens=max_tokens,
     )
-    return resp.choices[0].message.content or ""
+    if not resp.choices:
+        raise EmptyResponseError(f"no choices returned (id={getattr(resp, 'id', None)})")
+    content = resp.choices[0].message.content or ""
+    if not content.strip():
+        finish = resp.choices[0].finish_reason
+        raise EmptyResponseError(f"blank content (finish_reason={finish})")
+    return content
 
 
 def _call_anthropic(model_id: str, prompt: str, api_key: str, max_tokens: int) -> str:
@@ -143,7 +173,12 @@ def _call_google(
     """Returns (text, finish_reason)."""
     from google import genai
     from google.genai import types
-    client = genai.Client(api_key=api_key)
+    # HttpOptions.timeout is in milliseconds. Without it a half-open connection
+    # can hang the whole run indefinitely (the OpenAI path sets its own timeout).
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=int(REQUEST_TIMEOUT_S * 1000)),
+    )
 
     effective_max_tokens = max(max_tokens, min_max_tokens or 0)
     config_kwargs: dict = {
@@ -199,8 +234,48 @@ def _dispatch(cfg: dict, prompt: str, max_tokens: int) -> tuple[str, str]:
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 3) -> tuple[str, str, str]:
-    """Returns (response, finish_reason, error). On success error is '', on failure response is ''."""
+# HTTP statuses worth retrying: rate limit (429) and transient server errors.
+_RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+# openai-SDK exception class names that are transient regardless of status.
+_RETRYABLE_EXC_NAMES = {
+    "RateLimitError", "APITimeoutError", "APIConnectionError",
+    "InternalServerError", "APIConnectionTimeoutError",
+    # httpx / google-genai transport timeouts (Google path has no SDK retry)
+    "ReadTimeout", "ConnectTimeout", "WriteTimeout", "PoolTimeout",
+    "TimeoutException", "ConnectError",
+}
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """True for transient failures worth another attempt; False for hard errors
+    (e.g. 400 bad request, auth) so we don't burn the retry budget on them."""
+    if isinstance(exc, EmptyResponseError):
+        return True
+    if getattr(exc, "status_code", None) in _RETRYABLE_STATUS:
+        return True
+    return type(exc).__name__ in _RETRYABLE_EXC_NAMES
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """Honour a server-provided Retry-After header (seconds) when present."""
+    resp = getattr(exc, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after")
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 6) -> tuple[str, str, str]:
+    """Returns (response, finish_reason, error). On success error is '', on failure response is ''.
+
+    Retries transient failures (429s, 5xx, timeouts, blank OpenRouter responses)
+    with jittered exponential backoff, honouring a Retry-After header when the
+    server sends one. Non-retryable errors (bad request, auth) fail fast.
+    """
     last_err = ""
     for attempt in range(retries):
         try:
@@ -208,8 +283,14 @@ def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 3) 
             return response, finish_reason, ""
         except Exception as exc:
             last_err = f"{type(exc).__name__}: {exc}"
-            if attempt < retries - 1:
-                time.sleep(2 ** (attempt + 1))  # 2 s, then 4 s
+            if attempt == retries - 1 or not _is_retryable(exc):
+                break
+            retry_after = _retry_after_seconds(exc)
+            if retry_after is not None:
+                delay = retry_after + random.uniform(0, 1)
+            else:
+                delay = min(2 ** attempt, 30) + random.uniform(0, 1)  # 1,2,4,8,16,30s + jitter
+            time.sleep(delay)
     return "", "", last_err
 
 
@@ -301,10 +382,25 @@ def main() -> None:
         fh.flush()
 
         for model_cfg in active:
+            # Minimum seconds between the *starts* of consecutive requests to
+            # this model. Models with an "rpm" cap (e.g. Google's 5 req/min)
+            # override the global --delay; everyone else uses --delay.
+            rpm = model_cfg.get("rpm")
+            min_interval = max(args.delay, 60.0 / rpm) if rpm else args.delay
+            next_allowed = 0.0  # perf_counter timestamp of earliest next start
+
             for i, row in enumerate(
                 tqdm(prompts, desc=f"{model_cfg['label']:12s}", unit="prompt", leave=True)
             ):
+                # Throttle: don't start the next request until the interval has
+                # elapsed since the previous request started. Time spent inside
+                # the previous call counts toward the interval.
+                wait = next_allowed - time.perf_counter()
+                if wait > 0:
+                    time.sleep(wait)
+
                 t0 = time.perf_counter()
+                next_allowed = t0 + min_interval
                 response, finish_reason, error = _call_with_retry(model_cfg, row["prompt"], args.max_tokens)
                 latency = round(time.perf_counter() - t0, 3)
 
@@ -327,10 +423,6 @@ def main() -> None:
                     "timestamp":        datetime.now(timezone.utc).isoformat(),
                 })
                 fh.flush()
-
-                # Delay between calls, but not after the last prompt for this model
-                if args.delay > 0 and i < len(prompts) - 1:
-                    time.sleep(args.delay)
 
     print(f"\nDone. {total_calls} rows written → {out_path}")
 
