@@ -81,6 +81,11 @@ PROBE_MODELS: list[dict] = [
         "provider": "google",
         "model_id": "gemini-2.5-flash",
         "env_key":  "GOOGLE_API_KEY",
+        # gemini-2.5-flash spends output tokens on hidden "thinking" before the
+        # visible answer; at the default 512-token budget that left ~20 tokens
+        # for the actual reply. Disabling thinking (supported on this model)
+        # frees the whole budget for the answer.
+        "thinking_budget": 0,
     },
     {
         "label":    "kimi-k2",
@@ -94,6 +99,12 @@ PROBE_MODELS: list[dict] = [
         "provider": "google",
         "model_id": "gemma-4-31b-it",
         "env_key":  "GOOGLE_API_KEY",
+        # Unlike gemini-2.5-flash, this model rejects thinking_config
+        # ("Thinking budget is not supported for this model"), so thinking
+        # can't be disabled. It reliably burns ~500-560 tokens on hidden
+        # reasoning, so give it a floor well above that regardless of
+        # --max-tokens, or the visible answer gets truncated to near-empty.
+        "min_max_tokens": 2048,
     },
 ]
 
@@ -157,27 +168,46 @@ def _call_openai_sdk(
     return resp.choices[0].message.content or ""
 
 
-def _call_google(model_id: str, prompt: str, api_key: str, max_tokens: int) -> str:
+def _call_google(
+    model_id: str,
+    prompt: str,
+    api_key: str,
+    max_tokens: int,
+    thinking_budget: int | None = None,
+    min_max_tokens: int | None = None,
+) -> tuple[str, str]:
+    """Returns (text, finish_reason)."""
     from google import genai
     from google.genai import types
     client = genai.Client(api_key=api_key)
+
+    effective_max_tokens = max(max_tokens, min_max_tokens or 0)
+    config_kwargs: dict = {
+        "system_instruction": "You are a helpful assistant.",
+        "max_output_tokens": effective_max_tokens,
+    }
+    if thinking_budget is not None:
+        config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+
     resp = client.models.generate_content(
         model=model_id,
         contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction="You are a helpful assistant.",
-            max_output_tokens=max_tokens,
-        ),
+        config=types.GenerateContentConfig(**config_kwargs),
     )
-    return resp.text or ""
+    finish_reason = ""
+    if resp.candidates:
+        fr = resp.candidates[0].finish_reason
+        finish_reason = fr.name if fr is not None else ""
+    return resp.text or "", finish_reason
 
 
-def _dispatch_probe(cfg: dict, prompt: str, max_tokens: int) -> str:
+def _dispatch_probe(cfg: dict, prompt: str, max_tokens: int) -> tuple[str, str]:
+    """Returns (text, finish_reason). finish_reason is '' for non-Google providers."""
     api_key  = os.environ[cfg["env_key"]]
     provider = cfg["provider"]
     model_id = cfg["model_id"]
     if provider == "openai":
-        return _call_openai_sdk(model_id, prompt, api_key, max_tokens)
+        return _call_openai_sdk(model_id, prompt, api_key, max_tokens), ""
     if provider == "openai_compat":
         headers = (
             {"HTTP-Referer": "sentinelai-probe", "X-Title": "SentinelAI"}
@@ -186,23 +216,28 @@ def _dispatch_probe(cfg: dict, prompt: str, max_tokens: int) -> str:
         return _call_openai_sdk(
             model_id, prompt, api_key, max_tokens,
             base_url=cfg["base_url"], extra_headers=headers,
-        )
+        ), ""
     if provider == "google":
-        return _call_google(model_id, prompt, api_key, max_tokens)
+        return _call_google(
+            model_id, prompt, api_key, max_tokens,
+            thinking_budget=cfg.get("thinking_budget"),
+            min_max_tokens=cfg.get("min_max_tokens"),
+        )
     raise ValueError(f"Unknown provider: {provider}")
 
 
-def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 3) -> tuple[str, str]:
-    """Returns (response, error). On success error is empty string."""
+def _call_with_retry(cfg: dict, prompt: str, max_tokens: int, retries: int = 3) -> tuple[str, str, str]:
+    """Returns (response, finish_reason, error). On success error is empty string."""
     last_err = ""
     for attempt in range(retries):
         try:
-            return _dispatch_probe(cfg, prompt, max_tokens), ""
+            response, finish_reason = _dispatch_probe(cfg, prompt, max_tokens)
+            return response, finish_reason, ""
         except Exception as exc:
             last_err = f"{type(exc).__name__}: {exc}"
             if attempt < retries - 1:
                 time.sleep(2 ** (attempt + 1))
-    return "", last_err
+    return "", "", last_err
 
 
 # --------------------------------------------------------------------------- #
@@ -299,7 +334,7 @@ def phase_classify() -> None:
 
 _RESPONSE_FIELDS = [
     "id", "prompt", "attack_type", "surface_benignity",
-    "model", "model_id", "response", "error", "latency_s", "timestamp",
+    "model", "model_id", "response", "finish_reason", "error", "latency_s", "timestamp",
 ]
 
 
@@ -373,7 +408,7 @@ def phase_probe(
 
             for i, row in enumerate(pending_rows):
                 t0 = time.perf_counter()
-                response, error = _call_with_retry(model_cfg, str(row["prompt"]), max_tokens)
+                response, finish_reason, error = _call_with_retry(model_cfg, str(row["prompt"]), max_tokens)
                 latency = round(time.perf_counter() - t0, 3)
 
                 writer.writerow({
@@ -384,6 +419,7 @@ def phase_probe(
                     "model":            label,
                     "model_id":         model_cfg["model_id"],
                     "response":         response,
+                    "finish_reason":    finish_reason,
                     "error":            error,
                     "latency_s":        latency,
                     "timestamp":        datetime.now(timezone.utc).isoformat(),
