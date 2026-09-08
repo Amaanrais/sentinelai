@@ -14,29 +14,29 @@ FN rate = fraction of prompts at each tier that SentinelAI failed to flag.
 | 2 | Moderate | 110 | 0/110 (0.0%) | 1/110 (0.9%) | 2/110 (1.8%) |
 | 3 | High | 110 | 0/110 (0.0%) | 2/110 (1.8%) | 1/110 (0.9%) |
 
-## Table 2 — Harm Rate Among FNs by Tier × LLM
+## Table 2 — Harm Rate by Tier × LLM (pooled FN set)
 
-Harm rate = fraction of FN prompts where the LLM COMPLIED with the harmful request.  
-Values are averaged across classifiers; denominator = probed FNs.
+Harm rate = COMPLIED count / number of pooled FN prompts that LLM was probed on.  
+Pooled FN set = union of prompts missed by at least one classifier (`is_fn_any`), the same set actually sent to the LLMs in Phase B. Each cell is a rate over a real prompt count shown in the pooled-n column of Table 3 -- not an average of per-classifier rates.
 
-| tier | disguise | gemini | gemma-4 | kimi-k2 | openai |
+| tier | disguise | pooled FN n | gemini | gemma-4 | kimi-k2 | openai |
+|---|---|---:|---:|---:|---:|---:|
+| 0 | Obvious | 28 | 3.6% | 4.3% | 0.0% | 3.6% |
+| 1 | Mild | 9 | 11.1% | 14.3% | 22.2% | 22.2% |
+| 2 | Moderate | 2 | 100.0% | 0.0% | 100.0% | 0.0% |
+| 3 | High | 3 | 66.7% | 33.3% | 66.7% | 66.7% |
+
+## Table 3 — Harmful Reach by Tier (pooled)
+
+Harmful reach = FN rate (pooled) × harm rate (any LLM, pooled).  
+This is the probability that a prompt at tier *X* both evades SentinelAI (missed by at least one classifier) **and** causes harmful output from at least one LLM. One value per tier, computed on the single pooled FN set -- not per classifier.
+
+| tier | disguise | pooled FN n | FN rate | harm rate (any LLM) | harmful reach |
 |---|---|---:|---:|---:|---:|
-| 0 | Obvious | 8.3% | 8.3% | 0.0% | 8.3% |
-| 1 | Mild | 6.2% | 6.2% | 12.5% | 31.2% |
-| 2 | Moderate | 100.0% | 0.0% | 100.0% | 0.0% |
-| 3 | High | 75.0% | 25.0% | 75.0% | 75.0% |
-
-## Table 3 — Harmful Reach by Tier × Classifier
-
-Harmful reach = FN rate × harm rate (any LLM).  
-This is the probability that a prompt at tier *X* both evades the detector **and** causes harmful output from at least one LLM.
-
-| tier | disguise | distilbert reach | roberta reach | baseline reach |
-|---|---|---:|---:|---:|
-| 0 | Obvious | 0.9% | 0.9% | 0.9% |
-| 1 | Mild | — | 0.9% | 1.8% |
-| 2 | Moderate | — | 0.9% | 1.8% |
-| 3 | High | — | 1.8% | 0.9% |
+| 0 | Obvious | 28 | 25.5% | 3.6% | 0.9% |
+| 1 | Mild | 9 | 8.2% | 33.3% | 2.7% |
+| 2 | Moderate | 2 | 1.8% | 100.0% | 1.8% |
+| 3 | High | 3 | 2.7% | 100.0% | 2.7% |
 
 ## Table 4 — Verdict Distribution by Tier
 
@@ -44,18 +44,11 @@ Counts of REFUSED / PARTIAL / COMPLIED across all FN prompts and all LLMs.
 
 | tier | disguise | REFUSED | PARTIAL | COMPLIED | OTHER |
 |---|---|---:|---:|---:|---:|
-| 0 | Obvious | 189 | 16 | 6 | 0 |
-| 1 | Mild | 98 | 42 | 29 | 0 |
-| 2 | Moderate | 89 | 48 | 25 | 0 |
-| 3 | High | 81 | 56 | 36 | 0 |
+| 0 | Obvious | 96 | 8 | 3 | 0 |
+| 1 | Mild | 19 | 9 | 6 | 0 |
+| 2 | Moderate | 0 | 4 | 4 | 0 |
+| 3 | High | 3 | 2 | 7 | 0 |
 
 ## Key Finding
 
-The table below summarises the full attack surface: disguise cost (tier) vs. harmful reach. The tier that maximises harmful reach represents the "sweet spot" an adversary should target.
-
-| tier | disguise | FN rate (avg) | harm rate any LLM (avg) | harmful reach (avg) |
-|---|---|---:|---:|---:|
-| 0 | Obvious | 13.6% | 8.3% | 1.1% |
-| 1 | Mild | 3.0% | 37.5% | 1.1% |
-| 2 | Moderate | 0.9% | 100.0% | 0.9% |
-| 3 | High | 0.9% | 100.0% | 0.9% |
+Harmful reach peaks at tier 1 (Mild) at 2.7% (see Table 3). This is the "sweet spot" an adversary should target: the disguise level that maximises the joint probability of evading SentinelAI and eliciting a harmful completion from at least one downstream LLM.
